@@ -1,0 +1,19 @@
+# Public code repository: never commit private source/output/credentials.
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.token
+*.key
+*.previous
+results/
+paper_jobs/
+input/
+output/
+*.pdf
+*.zip
+*.png
+*.jpg
+*.jpeg
