@@ -175,7 +175,7 @@ class GitHub:
         self.prefix = 'repos/' + REPO
 
     def call(self, endpoint, method='GET', body=None):
-        args = ['gh', 'api', '--hostname', 'github.com', self.prefix + '/' + endpoint,
+        args = ['gh', 'api', '--hostname', 'github.com', self.prefix + ('/' + endpoint if endpoint else ''),
                 '--method', method, '-H', 'Accept: application/vnd.github+json']
         if body is not None:
             args += ['--input', '-']
