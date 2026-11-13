@@ -8,7 +8,7 @@ Private workspace: `JGUPTA2511/modulus-practice-corner`, branch `paper-workspace
 
 ## Batch routine on your Mac
 
-1. Select a batch input folder **outside** `~/Modulus Papers`. If every PDF/ZIP is a complete paper, choose `a` when prompted to scan loose files and all nested subfolders. If there are separate keys/solutions or PDF/export pairs, keep their explicit per-paper grouping so associations are not guessed. The earlier grouped format remains supported:
+1. Select a batch input folder **outside** `~/Modulus Papers`. Files sharing an explicit paper ID such as `GTM-28_QP.PDF`, `GTM-28_FINAL-KEY.PDF` and `GTM-28_KEY-&-SOLS.PDF` are automatically grouped in place: no per-paper folders or renaming are required for this convention. If other PDF/ZIP files are each complete papers, choose `a` when prompted to scan loose files and all nested subfolders. If there are separate keys/solutions or PDF/export pairs, keep their explicit per-paper grouping so associations are not guessed. The earlier grouped format remains supported:
 
    ```text
    Modulus Batch/
@@ -59,7 +59,7 @@ Local cropping and GitHub API file uploads **do not use GitHub Actions minutes**
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v` with Pillow and pdfplumber installed. Fixtures are synthetic and generated in temporary folders. GitHub writes in tests are simulated. Linux test success does not prove Mac installation, browser authentication, real paper upload or deployment.
+Run `python -m unittest discover -s tests -v` with Pillow, NumPy and pdfplumber installed (existing cropper dependencies). Fixtures are synthetic and generated in temporary folders. GitHub writes in tests are simulated. Linux test success does not prove Mac installation, browser authentication, real paper upload or deployment.
 
 ## An older Mac window or Word document
 
@@ -96,3 +96,24 @@ Optional CLI for a declared collection of complete files:
 ```sh
 python workspace_client.py batch "/path/Mixed Papers" --all-papers --exam-policy main-standard-advanced-source
 ```
+
+## Flat question/key/solutions folders
+
+The tool recognises the explicit `<PAPER-ID>_<ROLE>` contract case-insensitively and groups each ID separately. For example:
+
+```text
+Mixed Papers/
+  GTM-28_QP.PDF
+  GTM-28_KEY-&-SOLS.PDF
+  GTM-29_QP.PDF
+  GTM-29_FINAL-KEY.PDF
+  GTM-29_KEY-&-SOLS.PDF
+```
+
+Select this existing folder. No source movement, renaming, per-paper role prompts or `a` layout selection is needed. Select `x` at the marking question for a mixed Main/Advanced batch. Each question paper is processed once with only its own same-ID companions. Paper IDs are not used to infer Main versus Advanced. Common source headings such as JEE (Main)/JEE (Advanced) are recognised from source text.
+
+An explicit FINAL-KEY supplies the answers and the combined KEY-&-SOLS is retained as supplied, unmatched solutions. If no separate final/answer key is present, the combined PDF is passed to the unchanged cropper as the key and preserved under both canonical input roles. `key_from_file` already accepts combined documents, but recognises only pages with at least ten parsed key entries and has the previously documented key-format limits. Choosing a final filename is source selection, not mathematical verification. Worked solutions are not extracted/matched.
+
+Duplicate QPs/keys, missing same-ID question/export sources, mismatched IDs and unused independent key/solution variants are held explicitly. IDs are exact (GTM-2 never matches GTM-20); Unicode dash spellings normalise only the internal ID, leaving original names/bytes intact. Existing canonical/configured paper subfolders and source exports remain supported. Unknown files are listed with reasons instead of silently associated. Source association/priority is recorded in new job manifests. Existing immutable manifests/runs are reused without reformatting them for annotations. Identical combined-document content is posted once per sync and referenced by both input paths.
+
+This corrects input grouping; it does not change the accepted cropper/cleaning, bypass Advanced source-validation holds, deploy examinations or prove a completed actual Mac run.
