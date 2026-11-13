@@ -2,6 +2,12 @@
 
 328 synthetic Linux tests pass: 317 retained plus 11 retry regressions. A formerly unspecified held job can select Main settings and complete under the same ID while preserving the original manifest, source bytes and refusal run. Tests cover filename aliases, current settings snapshots, completed-crop reuse, duplicate-free simulated sync, changed source/key rejection, tampered/symlink originals, the shared lock and modified retry evidence. Compilation and diff checks pass. No real owner job, actual Mac retry, paper transfer or deployed exam is established by these tests.
 
+# Reusable image-to-portal pipeline — 13 November 2026
+
+397 synthetic Linux tests passed with `PYTHONPATH=/tmp/modulus-cropper-test-deps python -m unittest discover -s tests -v`. Compilation, both shell syntax checks and diff checks passed. Coverage includes all earlier tests, stable-ID held retries, image-ready exports without keys, later key/solution/settings supplements without recropping, typed multiple-correct arrays, source subjects/sections/common explicit rules, selective development uploads with private-target/concurrency protection, staging retries and watermark reduction. Original accepted rendering/cleaning/mask/trim/crop function AST checks pass.
+
+Development-side verification uses the existing catalogue/importer and existing Main/Advanced interface. Its private synthetic tests cover numerical0–4, multiple-correct partial credit, whole-paper launch holds, immutable imports and legacy compatibility; a real Linux Chromium run checks original-image loading, controls, timer, submission and provisional scores. No real paper data/results are stored here. GitHub transfer tests are simulated; actual Mac batch completion, real paper transfer, a full-bank build and Netlify deployment are not established by these checks. Unsupported/ambiguous source layouts and rules remain held, rather than fabricated.
+
 # Source detection and correction-sheet compatibility — 13 November 2026
 
 317 synthetic Linux tests passed with `python -m unittest discover -s tests -v` (247 retained +28 source-key +21 layout/section metadata +12 client +5 cropper geometry +4 staged updater tests). OpenCV is an existing Mac runtime dependency; cloud geometry tests used it from an isolated temporary test directory. Compilation, both shell syntax checks and diff checks passed. API operations remain simulated in tests.

@@ -140,7 +140,7 @@ class CompanionPipelineTests(unittest.TestCase):
         self.assertEqual(len(api.commit_trees), 1)
         self.assertEqual(len(self.calls), 1)
 
-    def test_changed_final_key_cannot_replace_original_or_completed_run(self):
+    def test_incomplete_changed_final_key_cannot_replace_original_or_completed_run(self):
         _, _, final = self.files(final=True)
         with patch.object(w.subprocess, 'run', side_effect=self.crop):
             w.run_batch(self.args())
@@ -150,7 +150,7 @@ class CompanionPipelineTests(unittest.TestCase):
         with patch.object(w.subprocess, 'run', side_effect=AssertionError('Do not recrop changed originals')):
             row = w.run_batch(self.args())[0]
         self.assertEqual(row['outcome'], 'held')
-        self.assertIn('different files or settings', row['reason'])
+        self.assertIn('incomplete or mismatched', row['reason'])
         self.assertEqual((folder / 'input/answer_key.pdf').read_bytes(), original)
         self.assertEqual(len(list((folder / 'runs').iterdir())), 1)
 

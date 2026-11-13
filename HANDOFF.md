@@ -1,5 +1,11 @@
 # Shared maintenance contract
 
+## General pipeline follow-through
+
+Read the latest private project context before declaring completion. The tool now includes `portal_bridge.py` (hash-bound selective development staging) and `paper_enrichment.py` (immutable later keys/solutions/settings using existing pixels). The launcher stages both with its existing modules before running. The client keeps `images_ready` distinct from a gradeable exam, uses source-typed multiple-correct arrays and has safe held-job retry snapshots. Supplemental sources and their parent image runs are validated and synced; source originals and root manifests remain immutable.
+
+`development:tools/import_paper_jobs.py` is the matching reusable adapter, called by the existing package build. New-import readiness is enforced by the existing browser/engine; do not bypass it by setting verified/scoring_verified. Explicit owner source-key authorization permits labelled provisional Advanced scoring without changing legacy rules. Unknown source rules/formats remain held. Public verification is397tests; private synthetic browser tests verify the existing UI. Actual Mac upload and a full-bank/Netlify deployment remain separate observations. Never call development staging deployed.
+
 The owner wants one system, not a competing cropper. Claude owns question_boundaries.py; ChatGPT owns workspace_client.py. Changes to the launcher must preserve the existing interactive question/answer-key flow. The cropper imported from the owner-approved bundle has SHA-256 adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc and was copied without algorithm changes.
 
 Private papers: JGUPTA2511/modulus-practice-corner, paper-workspace branch, paper_jobs/<PAPER-ID>/. Read that branch's AGENTS.md and HANDOFF.md. ChatGPT writes handoff/chatgpt.json; Claude writes handoff/claude.json. Mac owns status.json. Avoid same-file concurrent edits; refresh the current SHA and never force-push. Use small separate code branches for significant changes, then merge tested fixes into this public main. The private app's main must remain unchanged without publication approval.

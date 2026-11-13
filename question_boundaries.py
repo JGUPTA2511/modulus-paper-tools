@@ -883,7 +883,7 @@ def main():
         item.update(getattr(args, '_source_types', {}).get(item['number'], {}))
         item['option_labels'] = list(question.get('option_labels', []))
         kind = item.get('source_type')
-        if isinstance(kind, str) and kind.lower().replace('-', '_') in {
+        if 'option_key_basis' not in item and isinstance(kind, str) and kind.lower().replace('-', '_') in {
                 'single_choice', 'single_correct', 'multiple_correct', 'multi_correct',
                 'multiple_select', 'multi_select', 'mcq_single', 'mcq_multi'}:
             labels = set(item['option_labels'])

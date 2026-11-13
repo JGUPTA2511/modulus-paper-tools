@@ -477,7 +477,36 @@ def _sync_job(folder, api=None, queue_on_error=True):
         run_processing_job(folder, status, manifest_body)
         names = ('export.zip', 'exam.json', 'checks.json', 'run.json') if status['state'] in ('images_ready', 'ready_for_integration') else ('REFUSED.txt',)
         names += ('processing.json',)
+        names += ('portal/integration.json',)
         allowed += [run / n for n in names if (run / n).is_file()]
+        if (run / 'supplement.json').exists() or status.get('supplement_sha256'):
+            from paper_enrichment import supplement_payload
+            cursor, seen = run, set()
+            while (cursor / 'supplement.json').exists():
+                if cursor.name in seen:
+                    raise WorkspaceError('Cyclic supplement history refused.')
+                seen.add(cursor.name)
+                payload = supplement_payload(folder, cursor)
+                body = payload[cursor / 'supplement.json']
+                if cursor == run and status.get('supplement_sha256') != sha(body):
+                    raise WorkspaceError('Current supplement does not match its saved processing state.')
+                allowed.extend(payload)
+                validated.update(payload)
+                parent_id = json.loads(body)['parent_run_id']
+                cursor = folder / 'runs' / parent_id
+                parent_record = json.loads((cursor / 'run.json').read_text())
+                parent_data, parent_checks = validate_export(cursor / 'export.zip')
+                if (parent_record.get('input_manifest_sha256') != sha(manifest_body) or
+                        parent_record.get('export_sha256') != parent_checks['export_sha256'] or
+                        json.loads((cursor / 'exam.json').read_text()) != parent_data):
+                    raise WorkspaceError('Supplement parent run does not match its immutable images.')
+                run_processing_job(folder, {'run_id': parent_id,
+                    'processing_sha256': parent_record.get('processing_sha256')}, manifest_body, parent_record)
+                allowed.extend(cursor / name for name in ('run.json', 'export.zip', 'exam.json',
+                                                          'checks.json', 'processing.json')
+                               if (cursor / name).is_file())
+            if not (run / 'supplement.json').is_file():
+                raise WorkspaceError('Saved supplement manifest is missing.')
     files = {}
     for p in allowed:
         if p.is_symlink() or folder not in p.resolve().parents:
@@ -497,6 +526,19 @@ def _sync_job(folder, api=None, queue_on_error=True):
     save_json(folder / 'sync_receipt.json', dict(result, synced_at=now(), branch=BRANCH))
     print('SYNCED: ' + pid + ' | commit ' + result['commit'][:10])
     print('Both assistants can read: ' + REPO + ' / ' + BRANCH + ' / paper_jobs/' + pid)
+    if status['state'] in ('images_ready', 'ready_for_integration'):
+        from portal_bridge import PortalError, sync_job as sync_portal_job
+        try:
+            portal = sync_portal_job(folder, api=api)
+        except (PortalError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            if queue_on_error:
+                queue_sync(folder, 'Workspace synced; development staging pending: ' + str(exc))
+            raise WorkspaceError('Workspace synced; development staging is queued for retry without recropping: ' + str(exc)) from exc
+        result['portal'] = portal
+        if portal.get('status') == 'staged_in_development':
+            print('STAGED IN DEVELOPMENT: ' + pid + '. One approved Netlify release is still required.')
+        elif portal.get('status') == 'held':
+            print('INTEGRATION HELD: ' + pid + ' — ' + '; '.join(portal.get('blocking_requirements', [])[:3]))
     return result
 
 
@@ -688,6 +730,11 @@ def record_status(folder, job, state, run_id, **extra):
             raise WorkspaceError('Symlink retry settings refused.')
         if processing.is_file():
             extra['processing_sha256'] = sha(processing.read_bytes())
+        supplement = processing.parent / 'supplement.json'
+        if supplement.is_symlink():
+            raise WorkspaceError('Symlink supplement manifest refused.')
+        if supplement.is_file():
+            extra['supplement_sha256'] = sha(supplement.read_bytes())
     save_json(folder / 'status.json', {'schema': 'modulus_shared_status_v1',
         'paper_id': job['paper_id'], 'state': state, 'run_id': run_id,
         'updated_at': now(), 'updated_by': 'mac_runner',
@@ -734,7 +781,14 @@ def finish_run(folder, job, run, archive):
                                           else 'held_pending_source_type_marking_and_completeness_validation')
     record_status(folder, job, 'images_ready' if images_ready else 'ready_for_integration', run.name,
         questions=data['count'], **extra,
-        next_action='Assistant: identify source sections/types, map supplied solutions, validate selected marking, test portal integration.')
+        next_action='Validated source metadata stages automatically for the existing development portal; unresolved source evidence stays held.')
+    try:
+        from portal_bridge import prepare_job as prepare_portal_job
+        prepare_portal_job(folder)
+    except (ImportError, OSError, ValueError, RuntimeError, WorkspaceError) as exc:
+        # Image extraction remains useful even if a later integration stage
+        # needs source metadata or its own retry. Never discard saved pixels.
+        print('Local images kept; portal preparation needs attention: ' + str(exc)[:300])
 
 
 def cached_run(folder, export_sha=None, requested_job=None):
@@ -764,6 +818,12 @@ def cached_run(folder, export_sha=None, requested_job=None):
         raise WorkspaceError('Saved image-only state does not match its immutable export.')
     if json.loads((run.parent / 'exam.json').read_text()) != data or json.loads((run.parent / 'checks.json').read_text()).get('export_sha256') != checks['export_sha256']:
         raise WorkspaceError('Completed run metadata changed; restore it before retrying.')
+    if (run.parent / 'supplement.json').exists() or state.get('supplement_sha256'):
+        from paper_enrichment import supplement_payload
+        supplement_files = supplement_payload(folder, run.parent)
+        body = supplement_files.get(run.parent / 'supplement.json')
+        if body is None or state.get('supplement_sha256') != sha(body):
+            raise WorkspaceError('Saved supplement manifest changed; previous images were kept.')
     if export_sha:
         return previous.get('export_sha256') == export_sha
     compatible = {sha((HERE / 'question_boundaries.py').read_bytes()),
@@ -837,6 +897,27 @@ def _process(args):
     intent = getattr(args, 'exam_intent', None)
     if intent is None and args.profile in ('jee-main-mock', 'jee-advanced-source'):
         intent = inspect_exam_source(source=source)
+    existing = Path(args.root).expanduser().resolve() / paper_id(args.paper_id)
+    if (existing / 'status.json').is_file():
+        from paper_enrichment import can_enrich, enrich
+        eligible = can_enrich(existing, source, key, solutions, profile=args.profile)
+        state = json.loads((existing / 'status.json').read_text())
+        if eligible['eligible'] or (eligible.get('source_matches') and state.get('supplement_sha256')):
+            association = getattr(args, 'source_association', None) or {}
+            changes = eligible.get('changes', [])
+            changed_key = key if ('answer_key' in changes or 'missing_source_answers' in changes) else None
+            changed_solutions = solutions if 'solutions' in changes else None
+            base = solutions if (association.get('answer_key_basis') == 'final_key'
+                                 and association.get('combined_key_solutions_filename')
+                                 and changed_key is not None
+                                 and solutions is not None
+                                 and Path(solutions).name == association['combined_key_solutions_filename']) else None
+            enrich(existing, key=changed_key, solutions=changed_solutions, base_key=base,
+                   profile=args.profile, _locked=True)
+            print('Source metadata attached; existing question images reused: ' + args.paper_id)
+            if not args.offline:
+                _sync_job(existing)
+            return existing
     folder, job = prepare_job(args.root, args.paper_id, source, key, solutions,
                               args.profile, keep_color=keep_color, exam_intent=intent,
                               source_association=getattr(args, 'source_association', None))
@@ -2275,4 +2356,5 @@ def main():
     return 0
 
 if __name__ == '__main__':
+    sys.modules.setdefault('workspace_client', sys.modules[__name__])
     raise SystemExit(main())
