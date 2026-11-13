@@ -1,3 +1,11 @@
+# Source detection and correction-sheet compatibility — 13 November 2026
+
+317 synthetic Linux tests passed with `python -m unittest discover -s tests -v` (247 retained +28 source-key +21 layout/section metadata +12 client +5 cropper geometry +4 staged updater tests). OpenCV is an existing Mac runtime dependency; cloud geometry tests used it from an isolated temporary test directory. Compilation, both shell syntax checks and diff checks passed. API operations remain simulated in tests.
+
+The optional source reader proves a unique complete printed Main question sequence before selecting a shared margin. Tests cover competing option populations, singleton/continuation pages, glued option labels, source header-band conflicts, missing/duplicate/ambiguous anchors and parser fallback. No gaps are invented and no gate threshold is lowered. Section types come from printed headings, never answer values. AST hash assertions prove the accepted rendering, cleaning, bands, ink-mask, trim and crop functions are unchanged. Successful approved legacy exports remain immutable and reusable; held attempts retain their own runs.
+
+Key tests distinguish full final grids from sparse given/finalized correction tables, enforce identity/given-answer agreement, retain raw markers/provenance, preserve numerical zero, reject conflicts and record the owner's explicit original-answer policy for `Add`. Unknown markers still hold grading. Four real-Bash tests verify staged module updates and incomplete-download protection. Actual-source observations/results are recorded only in private context/handoff. These synthetic checks do not establish actual Mac crop/upload completion, arbitrary Advanced support, independent answer correctness, worked-solution matching or deployed examinations.
+
 # PDF preflight compatibility and source-title correction — 13 November 2026
 
 **247 tests passed** with `python -m unittest discover -s tests -v` on Linux (229 prior + 14 PDF compatibility + 4 additional source-title regressions). Python compilation, both shell syntax checks and `git diff --check` passed. Tested client blob: `e3886d7af147c7ac8130e6a315c6dd68c6641fb4`. Cropper SHA remains unchanged `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.

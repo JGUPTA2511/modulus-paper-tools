@@ -403,6 +403,35 @@ def trim_box(mask, x0, y0, x1, y1, pad):
 
 # ----------------------------------------------------------------------------- detection
 def detect(pdf, page_files, args):
+    # Compatibility is opt-in. The accepted default cropper, cleaning and
+    # geometry remain available unchanged. Trust a shared question margin only
+    # when the source itself proves one complete, unambiguous sequence.
+    layout, source_pages = None, None
+    if pdf and getattr(args, 'source_compat', False):
+        import pdfplumber
+        from source_layout import calibrate_single_column, option_prefix_label
+        try:
+            with pdfplumber.open(str(pdf)) as document:
+                k = args.dpi / 72.0
+                source_pages = [dict(width=page.width * k, height=page.height * k,
+                                     text=page.extract_text() or '',
+                                     words=[dict(text=w['text'], x0=w['x0'] * k, x1=w['x1'] * k,
+                                                 top=w['top'] * k, bottom=w['bottom'] * k)
+                                            for w in page.extract_words(keep_blank_chars=False, use_text_flow=False)])
+                                for page in document.pages]
+            layout = calibrate_single_column(source_pages, candidates)
+            if layout:
+                from source_layout import source_question_types
+                args._source_types = source_question_types(source_pages, layout)
+            from source_keys import identity_from_pages
+            args._source_identity = identity_from_pages(source_pages)
+        except Exception as exc:
+            # An optional text-layout hint must not remove the existing local
+            # text-reader/OCR fallback on renderable sources.
+            source_pages = None
+            layout = None
+            args._source_inspection_error = type(exc).__name__
+        args._source_layout = layout
     pages = []          # per-page info
     page_key = {}       # answer key found on key pages of this PDF
     page_words, page_markers = [], []
@@ -415,14 +444,28 @@ def detect(pdf, page_files, args):
         imgs.append(img)
         masks.append(ink_mask(np.array(img.convert('L'))))
     bands = detect_bands(masks)
+    if bands and layout:
+        top, bottom = bands
+        anchors_outside = any(not top <= a['y'] <= bottom
+                              for anchors in layout['anchors_by_page'] for a in anchors)
+        continuation_options_outside = any(
+            not (top <= word['top'] and word['bottom'] <= bottom)
+            for pi in layout['continuation_page_indexes'] for word in source_pages[pi]['words']
+            if OPT_RE.match(word['text']) or option_prefix_label(word['text']))
+        if anchors_outside or continuation_options_outside:
+            # Repeated body rows can resemble a header/footer. Source-proven
+            # question numbers take precedence over that optional inference.
+            bands = None
+            layout['band_mode'] = 'fixed_margins_inferred_bands_conflict_with_source'
 
     for pi, pf in enumerate(page_files):
         img = imgs[pi]
         gray = np.array(img.convert('L'))
         H, W = gray.shape
-        words = text_layer_words(pdf, pi, args.dpi) if pdf else []
+        words = (source_pages[pi]['words'] if source_pages is not None else
+                 text_layer_words(pdf, pi, args.dpi) if pdf else [])
         source = 'text'
-        if len(words) < 25:
+        if len(words) < 25 and not layout:
             words, source = ocr_words(img), 'ocr'
         if bands:
             top_lim, bot_lim = bands
@@ -435,7 +478,12 @@ def detect(pdf, page_files, args):
         cands = [] if is_key_page else [c for c in candidates(words) if top_lim <= c['y'] <= bot_lim]
         cols = cluster_columns(cands, W)
         cols.sort(key=lambda c: np.mean([k['x'] for k in c]))
-        if source == 'ocr' and cols:
+        if layout:
+            # These are existing source number anchors, not guessed gaps or
+            # option labels promoted into questions. Keep singleton columns.
+            trusted = [a for a in layout['anchors_by_page'][pi] if top_lim <= a['y'] <= bot_lim]
+            cols = [trusted] if trusted or pi in layout['continuation_page_indexes'] else []
+        if source == 'ocr' and cols and not layout:
             extra = recover_margin_numbers(gray, masks[pi], cols, cands, W)
             for e in extra:
                 best = min(cols, key=lambda cl: abs(np.mean([k['x'] for k in cl]) - e['x']))
@@ -478,13 +526,23 @@ def detect(pdf, page_files, args):
         mask = masks[pi]
         H, W = mask.shape
         cols = pages[pi]['_cols']
-        xs = [np.mean([k['x'] for k in c]) for c in cols]
+        xs = [np.mean([k['x'] for k in c]) if c else layout['margin_ratio'] * W for c in cols]
         top_lim, bot_lim = pages[pi]['content_rows']
         for ci in range(len(cols)):
             anchors = by_page_col.get((pi, ci), [])
             cx0 = int(max(0, xs[ci] - W * 0.03))
             cx1 = int(xs[ci + 1] - W * 0.015) if ci + 1 < len(cols) else W
             if not anchors:
+                if layout and pi in layout['continuation_page_indexes'] and prev_q is not None:
+                    # A source-proven interior page can contain only the end
+                    # of the preceding question. Apply the existing trim and
+                    # section-stop rules to that full-width continuation.
+                    stops = [m['y'] for m in page_markers[pi]
+                             if cx0 - W * 0.05 <= m['x'] <= cx1 and top_lim <= m['y'] < bot_lim]
+                    end = int(min(stops)) - 3 if stops else bot_lim
+                    box = trim_box(mask, cx0, top_lim, cx1, end, args.pad)
+                    if box and box[3] - box[1] > H * 0.01:
+                        prev_q['parts'].append(dict(page=pi, box=list(map(int, box)), continuation=True))
                 continue
             pad_up = int(args.pad * 0.8)
             starts = []
@@ -538,6 +596,14 @@ def detect(pdf, page_files, args):
         labs = set()
         for part in q['parts']:
             labs |= option_labels(page_words[part['page']], part['box'])
+            if layout:
+                from source_layout import option_prefix_label
+                x0, y0, x1, y1 = part['box']
+                for word in page_words[part['page']]:
+                    cx, cy = (word['x0'] + word['x1']) / 2, (word['top'] + word['bottom']) / 2
+                    label = option_prefix_label(word['text'])
+                    if label and x0 <= cx <= x1 and y0 <= cy <= y1:
+                        labs.add(label)
         q['options_found'] = len(labs)
     for p in pages:
         p.pop('_cols', None)
@@ -642,6 +708,10 @@ def main():
     ap.add_argument('source', nargs='?', help='question paper PDF, or a folder of page images')
     ap.add_argument('--out', default='boundaries_out', help='output folder')
     ap.add_argument('--key', metavar='KEY_PDF', help='separate answer-key PDF (if the key is not inside the paper PDF)')
+    ap.add_argument('--source-compat', action='store_true', help='use conservative source-proven layout/key compatibility; retain original cleaning and crop geometry')
+    ap.add_argument('--key-base', metavar='KEY_PDF', help='complete source key accompanying an explicitly selected final correction sheet')
+    ap.add_argument('--add-key-policy', choices=('unresolved', 'original'), default='unresolved',
+                    help='explicit adjudication for an Add correction marker; original keeps its matching base answer')
     ap.add_argument('--no-clean', action='store_true', help='do NOT remove watermarks / faint marks from the page images')
     ap.add_argument('--keep-color', action='store_true', help='keep coloured ink (by default coloured pen marks / highlighter are removed, which also removes coloured diagrams)')
     ap.add_argument('--diagnose', action='store_true', help='(for debugging only) write previews even when the upload is refused; never used by the Mac launcher')
@@ -651,6 +721,8 @@ def main():
     ap.add_argument('--skip-top', type=float, default=0.04, help='ignore this fraction of page top (header)')
     ap.add_argument('--skip-bottom', type=float, default=0.04, help='ignore this fraction of page bottom (footer)')
     args = ap.parse_args()
+    if args.key_base and (not args.source_compat or not args.key):
+        ap.error('--key-base requires --source-compat and --key')
 
     if args.recrop:
         out = Path(args.recrop)
@@ -682,9 +754,36 @@ def main():
     pages, questions, key = detect(pdf, files, args)
     for pg in pages:
         pg['cleaned_pct'] = cleaned.get(pg['file'], 0)
-    if args.key:
+    source_key = None
+    if args.key and args.source_compat:
+        from source_keys import read_key_sources
+        source_key = read_key_sources(base_path=args.key_base, final_path=args.key,
+                                      expected_identity=getattr(args, '_source_identity', None),
+                                      expected_numbers=(range(1, args._source_layout['expected_count'] + 1)
+                                                        if getattr(args, '_source_layout', None) else None),
+                                      add_policy=args.add_key_policy,
+                                      legacy_parser=parse_key)
+        key = source_key['key']
+        # Textless keys retain the original local OCR reader. A recognized
+        # correction sheet must never fall back to stale base answers.
+        if not key and source_key.get('legacy_fallback_allowed'):
+            key = key_from_file(args.key, args.dpi)
+            if key:
+                source_key['key'] = key
+                source_key['unresolved'] = [reason for reason in source_key['unresolved']
+                                            if reason != 'No complete source key was parsed.']
+                source_key['reader_fallback'] = 'original_same_document_local_reader'
+        (out / 'source_key.json').write_text(json.dumps(source_key, indent=1))
+    elif args.key:
         key = key_from_file(args.key, args.dpi)
     why = gate(pages, questions, key)
+    layout = getattr(args, '_source_layout', None)
+    if layout:
+        evidence = {name: value for name, value in layout.items() if name != 'anchors_by_page'}
+        evidence['question_count_detected'] = len(questions)
+        (out / 'source_layout.json').write_text(json.dumps(evidence, indent=1))
+        if len(questions) != layout['expected_count']:
+            why.append('detected question count does not match the printed source declaration')
     if why:
         out.mkdir(parents=True, exist_ok=True)
         msg = 'REFUSED - this upload does not meet the required format:\n' + '\n'.join(f'  - {w}' for w in why) + \
@@ -700,9 +799,19 @@ def main():
     make_crops(out, pages, questions)
     flagged = write_review(out, pages, questions)
     exam = [dict(number=q['number'], image=f"crops/Q{q['number']:03d}.png", answer=key.get(q['number'])) for q in questions]
-    (out / 'exam.json').write_text(json.dumps(dict(source=src.name, count=len(exam), questions=exam), indent=1))
+    for item in exam:
+        item.update(getattr(args, '_source_types', {}).get(item['number'], {}))
+    export = dict(source=src.name, count=len(exam), questions=exam)
+    if source_key is not None:
+        export['source_key'] = {name: value for name, value in source_key.items() if name != 'key'}
+    if layout:
+        export['source_layout'] = evidence
+    (out / 'exam.json').write_text(json.dumps(export, indent=1))
     print((out / 'REPORT.txt').read_text())
-    print(f'ACCEPTED: {len(questions)} questions, each with its answer. {len(flagged)} flagged. Open {out}/review.html')
+    if source_key and source_key.get('unresolved'):
+        print(f'EXTRACTED: {len(questions)} question images; source-key adjudication remains unresolved. Exam grading is held.')
+    else:
+        print(f'ACCEPTED: {len(questions)} questions, each with its answer. {len(flagged)} flagged. Open {out}/review.html')
     print('Crops in crops/ are clean page pixels: no boxes, labels or marks are ever drawn on them (boxes appear only in preview/).')
 
 
