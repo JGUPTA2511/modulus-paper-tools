@@ -37,18 +37,31 @@ if ! "$MODULUS_PYTHON" -c 'import PIL,numpy,cv2,pytesseract,pdfplumber' 2>/dev/n
   "$MODULUS_PYTHON" -m pip install --quiet --disable-pip-version-check pillow numpy opencv-python-headless pytesseract pdfplumber
 fi
 BASE='https://raw.githubusercontent.com/JGUPTA2511/modulus-paper-tools/main'
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-if curl -fsSL --max-time 15 "$BASE/workspace_client.py" -o "$TMP" && "$MODULUS_PYTHON" -m py_compile "$TMP"; then
-  if ! cmp -s "$TMP" "$HERE/workspace_client.py"; then
-    [ ! -f "$HERE/workspace_client.py" ] || cp "$HERE/workspace_client.py" "$HERE/workspace_client.py.previous"
-    mv "$TMP" "$HERE/workspace_client.py"
+MODULUS_UPDATE_DIR="$(mktemp -d)"
+trap 'rm -rf "$MODULUS_UPDATE_DIR"' EXIT
+# Stage the client, cropper and its small readers together. A partial download
+# must not install a client that depends on a missing reader.
+MODULUS_UPDATE_OK=true
+for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py workspace_client.py; do
+  if ! curl -fsSL --max-time 15 "$BASE/$MODULUS_TOOL_FILE" -o "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" || \
+     [ ! -s "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" ] || \
+     ! "$MODULUS_PYTHON" -m py_compile "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE"; then
+    MODULUS_UPDATE_OK=false
+    break
   fi
+done
+if [ "$MODULUS_UPDATE_OK" = true ]; then
+  for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py workspace_client.py; do
+    if ! cmp -s "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE"; then
+      [ ! -f "$HERE/$MODULUS_TOOL_FILE" ] || cp "$HERE/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE.previous"
+      mv "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE"
+    fi
+  done
 elif [ ! -f "$HERE/workspace_client.py" ]; then
-  echo 'Could not download workspace_client.py. Your original PDFs have not been touched.'
+  echo 'Could not download the complete tool update. Your original PDFs have not been touched.'
   exit 1
 else
-  echo 'Using the installed workspace client; update check unavailable.'
+  echo 'Using the installed tool; complete update unavailable.'
 fi
 # No gh install, auth status, login or Git credential prompts at startup.
 # The client offers an explicit Connect action; paper work starts immediately.

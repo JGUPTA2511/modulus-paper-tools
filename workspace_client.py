@@ -6,8 +6,9 @@ Use the existing Run_Question_Boundaries.command launcher. CLI examples:
   python workspace_client.py attach GTM-01_result.zip --paper-id GTM-01
   python workspace_client.py sync "$HOME/Modulus Papers/GTM-01"
 
-Claude's question_boundaries.py is executed unchanged. Only structural checks
-are made here; source answers and crop completeness are not independently verified.
+Claude's question_boundaries.py supplies the existing crop/cleaning pipeline.
+Source compatibility readers are opt-in; structural checks do not independently
+verify answers or complete question boundaries.
 """
 from __future__ import annotations
 import argparse
@@ -36,6 +37,7 @@ MAX_FILE = 24 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
 SKIP = '[skip ci] [skip netlify]'
 HERE = Path(__file__).resolve().parent
+APPROVED_LEGACY_CROPPER_SHA256 = 'adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc'
 ID_RE = re.compile(r'^[A-Z0-9][A-Z0-9_-]{0,79}$')
 
 class WorkspaceError(Exception):
@@ -239,11 +241,26 @@ def validate_export(source):
             if z.testzip() is not None:
                 raise WorkspaceError('ZIP checksum error.')
             report = z.read('REPORT.txt').decode('utf-8', errors='replace') if 'REPORT.txt' in names else ''
-            return data, {'structural_check': 'passed', 'questions': count,
+            check = {'structural_check': 'passed', 'questions': count,
                 'images': count, 'answers': count, 'export_sha256': sha(source.read_bytes()),
                 'answer_status': 'source_transcribed_unverified',
                 'crop_visual_review': 'not_performed_by_sync_tool',
                 'cropper_report': report[:20000]}
+            for field in ('source_key', 'source_layout'):
+                if field in data:
+                    if not isinstance(data[field], dict):
+                        raise WorkspaceError('Malformed ' + field + ' evidence.')
+                    check[field] = data[field]
+            key_evidence = data.get('source_key', {})
+            unresolved = key_evidence.get('unresolved', [])
+            if not isinstance(unresolved, list):
+                raise WorkspaceError('Malformed source-key adjudication evidence.')
+            if unresolved:
+                check.update(answer_status='source_adjudication_required',
+                             unresolved_source_adjudication=unresolved,
+                             marking_state='source_adjudication_required',
+                             exam_launch_ready=False)
+            return data, check
     except WorkspaceError:
         raise
     except Exception as exc:
@@ -507,7 +524,8 @@ def finish_run(folder, job, run, archive):
         check['exam_intent'] = intent
         check['exam_launch_ready'] = False
         check['source_completeness'] = 'unverified_requires_source_scoped_question_counts'
-        check['marking_state'] = 'owner_selected_main_rules' if job['profile'] == 'jee-main-mock' else 'source_validation_required'
+        if not check.get('unresolved_source_adjudication'):
+            check['marking_state'] = 'owner_selected_main_rules' if job['profile'] == 'jee-main-mock' else 'source_validation_required'
     save_json(run / 'exam.json', data)
     save_json(run / 'checks.json', check)
     save_json(run / 'run.json', {'run_id': run.name, 'completed_at': now(),
@@ -520,6 +538,10 @@ def finish_run(folder, job, run, archive):
         extra = {'exam_family': intent['exam_family'], 'required_exam_pattern': intent.get('exam_pattern'),
                  'integration_state': 'held_pending_source_type_marking_and_completeness_validation',
                  'exam_launch_ready': False}
+    if check.get('unresolved_source_adjudication'):
+        extra.update(integration_state='held_pending_source_key_adjudication',
+                     exam_launch_ready=False, marking_state='source_adjudication_required',
+                     unresolved_source_adjudication=check['unresolved_source_adjudication'])
     record_status(folder, job, 'ready_for_integration', run.name, questions=data['count'], **extra,
         next_action='Assistant: identify source sections/types, map supplied solutions, validate selected marking, test portal integration.')
 
@@ -548,7 +570,10 @@ def cached_run(folder, export_sha=None):
         raise WorkspaceError('Completed run metadata changed; restore it before retrying.')
     if export_sha:
         return previous.get('export_sha256') == export_sha
-    return previous.get('input_manifest_sha256') == sha((folder / 'job.json').read_bytes()) and previous.get('cropper_sha256') == sha((HERE / 'question_boundaries.py').read_bytes())
+    compatible = {sha((HERE / 'question_boundaries.py').read_bytes()),
+                  APPROVED_LEGACY_CROPPER_SHA256}
+    return (previous.get('input_manifest_sha256') == sha((folder / 'job.json').read_bytes())
+            and previous.get('cropper_sha256') in compatible)
 
 
 def new_run(folder):
@@ -561,7 +586,8 @@ def new_run(folder):
 
 
 def package_output(output, destination):
-    selected = [output / 'exam.json', output / 'REPORT.txt', output / 'boundaries.json']
+    selected = [output / name for name in ('exam.json', 'REPORT.txt', 'boundaries.json',
+                                          'source_key.json', 'source_layout.json')]
     selected += sorted((output / 'crops').glob('*.png'))
     with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as z:
         for p in selected:
@@ -572,6 +598,36 @@ def package_output(output, destination):
 def process(args):
     with job_lock(args.root, args.paper_id):
         return _process(args)
+
+
+def associated_base_key(folder, job):
+    """Use a combined base only when immutable same-ID role records prove it."""
+    association = job.get('source_association', {})
+    inputs = job.get('inputs', {})
+    if not isinstance(association, dict) or not isinstance(inputs, dict):
+        return None
+    filenames = association.get('filenames', {})
+    final_input, combined_input = inputs.get('answer_key', {}), inputs.get('solutions', {})
+    if not all(isinstance(value, dict) for value in (filenames, final_input, combined_input)):
+        return None
+    if (association.get('method') != 'explicit_companion_filenames'
+            or association.get('answer_key_basis') != 'final_key'):
+        return None
+    final_name = association.get('final_key_filename')
+    combined_name = association.get('combined_key_solutions_filename')
+    if (not isinstance(final_name, str) or not isinstance(combined_name, str)
+            or final_input.get('original_name') != final_name
+            or combined_input.get('original_name') != combined_name
+            or filenames.get('answer_key.pdf') != final_name
+            or filenames.get('solutions.pdf') != combined_name):
+        return None
+    final = _companion_filename(final_name)
+    combined = _companion_filename(combined_name)
+    if (not final or not combined or final['reason'] or combined['reason']
+            or final['role'] != 'final_key' or combined['role'] != 'combined'
+            or final['paper_id'] != combined['paper_id']):
+        return None
+    return folder / 'input/solutions.pdf'
 
 
 def _process(args):
@@ -599,9 +655,13 @@ def _process(args):
     # result or refusal exists, so upload retry never requires recropping.
     output = run / 'local_crop_output'
     command = [sys.executable, str(HERE / 'question_boundaries.py'),
-               str(folder / 'input/questions.pdf'), '--out', str(output)]
+               str(folder / 'input/questions.pdf'), '--out', str(output), '--source-compat',
+               '--add-key-policy', 'original']
     if key:
         command += ['--key', str(folder / 'input/answer_key.pdf')]
+        base_key = associated_base_key(folder, job)
+        if base_key is not None:
+            command += ['--key-base', str(base_key)]
     if keep_color:
         command += ['--keep-color']
     try:
@@ -1775,6 +1835,10 @@ def run_batch(args, entries=None):
                 row['required_exam_pattern'] = item['exam_intent'].get('exam_pattern')
                 row['integration_state'] = 'held_pending_source_type_marking_and_completeness_validation'
                 row['exam_launch_ready'] = False
+            if current.get('unresolved_source_adjudication'):
+                row['integration_state'] = 'held_pending_source_key_adjudication'
+                row['exam_launch_ready'] = False
+                row['unresolved_source_adjudication'] = current['unresolved_source_adjudication']
             if args.offline:
                 row.update(outcome='already processed' if reused else 'upload failed/local-only',
                            reason='Local results retained; offline mode selected.')
@@ -1791,7 +1855,10 @@ def run_batch(args, entries=None):
                 except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
                     row.update(outcome='upload failed/local-only', reason=str(exc) + ' Upload queued; crops are saved and retry without recropping.')
             if row.get('integration_state'):
-                row['reason'] = (row['reason'] + ' ' if row['reason'] else '') + 'Exam launch held: validate source sections, completeness and marking in the required Main/Advanced flow.'
+                hold = ('Exam grading held: finalized source-key entries require clarification.'
+                        if row.get('unresolved_source_adjudication') else
+                        'Exam launch held: validate source sections, completeness and marking in the required Main/Advanced flow.')
+                row['reason'] = (row['reason'] + ' ' if row['reason'] else '') + hold
         except Exception as exc:
             row['reason'] = str(exc)
             # A refusal is useful to collaborators, but never hide it behind an upload error.
