@@ -253,6 +253,19 @@ class SourceLayoutTests(unittest.TestCase):
         self.assertEqual(set(types), set(range(1, 5)) | set(range(9, 13)))
         self.assertEqual(source_question_types(pages, None), {})
 
+    def test_subjects_come_from_printed_headers_and_new_subject_resets_unknown_type(self):
+        pages = source()
+        self.heading(pages[1], 'PHYSICS Max Marks: 80', 20)
+        self.heading(pages[1], '(SINGLE CORRECT ANSWER TYPE)', 50)
+        self.heading(pages[2], 'CHEMISTRY', 20)
+        self.heading(pages[3], '(NUMERICAL VALUE TYPE)', 50)
+        result = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertEqual(result[1]['subject'], 'Physics')
+        self.assertEqual(result[1]['subject_source']['text'], 'PHYSICS Max Marks: 80')
+        self.assertNotIn(5, result)
+        self.assertEqual(result[9]['subject'], 'Chemistry')
+        self.assertEqual(result[9]['source_type'], 'numerical')
+
 
 if __name__ == '__main__':
     unittest.main()

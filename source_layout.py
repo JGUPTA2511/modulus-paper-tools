@@ -274,7 +274,10 @@ def source_question_types(pages, layout):
     headings = {'SINGLE CORRECT ANSWER TYPE': 'single_choice',
                 'NUMERICAL VALUE TYPE': 'numerical'}
     normalize = lambda value: re.sub(r'[^A-Za-z0-9]+', ' ', value).strip().upper()
-    result, current = {}, None
+    result, current, current_subject = {}, None, None
+    subjects = {'MATHEMATICS': 'Mathematics', 'MATHS': 'Mathematics',
+                'PHYSICS': 'Physics', 'CHEMISTRY': 'Chemistry',
+                'BIOLOGY': 'Biology', 'BOTANY': 'Botany', 'ZOOLOGY': 'Zoology'}
     first, last = layout['first_page_index'], layout['last_page_index']
     for pi in range(first, last + 1):
         rows = []
@@ -297,6 +300,11 @@ def source_question_types(pages, layout):
             if i in used:
                 continue
             raw, normalized, end = row['raw'], row['normalized'], row['bottom']
+            subject_label = re.fullmatch(r'(MATHEMATICS|MATHS|PHYSICS|CHEMISTRY|BIOLOGY|BOTANY|ZOOLOGY)(?: MAX(?:IMUM)? MARKS? \d+)?', normalized)
+            if subject_label:
+                events.append((end, 2, {'subject': subjects[subject_label.group(1)],
+                                       'subject_source': {'page': pi + 1, 'text': raw,
+                                                          'basis': 'explicit_printed_subject_heading'}}))
             if normalized not in headings and i + 1 < len(rows):
                 following = rows[i + 1]
                 joined = normalized + ' ' + following['normalized']
@@ -315,10 +323,15 @@ def source_question_types(pages, layout):
                            ('ANSWER', 'VALUE', 'MATCH', 'MATRIX', 'INTEGER', 'COMPREHENSION')))):
                 events.append((end, 0, None))
         events.extend((anchor['y'], 1, anchor['n']) for anchor in by_page[pi])
-        for _, kind, value in sorted(events, key=lambda item: (item[0], item[1])):
+        for _, kind, value in sorted(events, key=lambda item: (item[0], item[1] == 1)):
             if kind == 0:
                 current = value
+            elif kind == 2:
+                current_subject = value
+                current = None
             elif current is not None:
                 result[value] = {'source_type': current['source_type'],
                                  'source_section': dict(current['source_section'])}
+                if current_subject is not None:
+                    result[value].update(current_subject)
     return result

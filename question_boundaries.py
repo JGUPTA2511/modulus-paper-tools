@@ -26,6 +26,7 @@ How it finds questions
 import argparse
 import html
 import json
+import math
 import re
 import subprocess
 import sys
@@ -370,6 +371,74 @@ def gate(pages, questions, key):
     return why
 
 
+def image_first_gate(pages, questions, key, layout, source_types, source_key=None):
+    """Separate source-proven image extraction from answer/marking readiness.
+
+    A count alone is insufficient: this path requires the calibrated original
+    source sequence and nonempty parts. It never manufactures a missing anchor
+    or interprets an answer value as a question type.
+    """
+    structural, grading = [], []
+    expected = layout.get('expected_count') if isinstance(layout, dict) else None
+    if (not isinstance(layout, dict)
+            or layout.get('basis') != 'unique_complete_printed_single_column_sequence'
+            or type(expected) is not int or expected < 1):
+        return ['Image-only extraction requires a source-proven complete question sequence.'], grading
+    numbers = [q.get('number') for q in questions]
+    anchors = [a.get('n') for row in layout.get('anchors_by_page', []) for a in row]
+    required = list(range(1, expected + 1))
+    if numbers != required or anchors != required:
+        structural.append('Question images do not match the complete original source sequence.')
+    for question in questions:
+        parts = question.get('parts')
+        if not isinstance(parts, list) or not parts:
+            structural.append(f"Q{question.get('number')}: no complete image parts.")
+            continue
+        for part in parts:
+            index = part.get('page') if isinstance(part, dict) else None
+            box = part.get('box') if isinstance(part, dict) else None
+            if (type(index) is not int or not 0 <= index < len(pages)
+                    or not isinstance(box, (list, tuple)) or len(box) != 4
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                           or not math.isfinite(v) for v in box)):
+                structural.append(f"Q{question.get('number')}: invalid source image part.")
+                continue
+            x0, y0, x1, y1 = box
+            if (not 0 <= x0 < x1 <= pages[index]['w']
+                    or not 0 <= y0 < y1 <= pages[index]['h'] or x1 - x0 < 2 or y1 - y0 < 2):
+                structural.append(f"Q{question.get('number')}: empty or outside source image part.")
+        if any(flag == 'empty_box' or flag.startswith('missing_numbers_before:')
+               for flag in question.get('flags', [])):
+            structural.append(f"Q{question.get('number')}: incomplete source detection.")
+    option_count = sum(q.get('options_found', 0) >= 3 for q in questions)
+    if option_count < 0.65 * len(questions):
+        numeric = {'numerical', 'numeric', 'numerical_value', 'integer', 'integer_type'}
+        multiple = {'multiple_correct', 'multi_correct', 'multiple_select', 'multi_select', 'mcq_multi'}
+        single = {'single_choice', 'single_correct', 'mcq_single', 'mcq'}
+        for question in questions:
+            record = source_types.get(question.get('number'), {})
+            kind = record.get('source_type') if isinstance(record, dict) else None
+            kind = kind.strip().lower().replace('-', '_').replace(' ', '_') if isinstance(kind, str) else None
+            if kind in numeric | multiple:
+                continue
+            if kind in single and question.get('options_found', 0) >= 3:
+                continue
+            structural.append('Source sections do not establish the low-option response formats; image completeness remains held.')
+            break
+    present = set(key)
+    missing = sorted(set(numbers) - present)
+    extra = sorted(present - set(numbers))
+    if missing:
+        grading.append('Source answers missing for question numbers: ' + ','.join(map(str, missing)))
+    if extra:
+        grading.append('Source key has unassociated question numbers: ' + ','.join(map(str, extra)))
+    if source_key and source_key.get('unresolved'):
+        grading.extend(str(reason) for reason in source_key['unresolved'])
+    if not grading:
+        grading.append('Source response types and marking require validation before grading.')
+    return list(dict.fromkeys(structural)), list(dict.fromkeys(grading))
+
+
 # ----------------------------------------------------------------------------- geometry helpers
 def ink_mask(gray):
     """Dark pixels, minus long straight lines (page borders, frames) that are not content."""
@@ -605,6 +674,7 @@ def detect(pdf, page_files, args):
                     if label and x0 <= cx <= x1 and y0 <= cy <= y1:
                         labs.add(label)
         q['options_found'] = len(labs)
+        q['option_labels'] = sorted(labs)
     for p in pages:
         p.pop('_cols', None)
     return pages, questions, page_key
@@ -709,6 +779,7 @@ def main():
     ap.add_argument('--out', default='boundaries_out', help='output folder')
     ap.add_argument('--key', metavar='KEY_PDF', help='separate answer-key PDF (if the key is not inside the paper PDF)')
     ap.add_argument('--source-compat', action='store_true', help='use conservative source-proven layout/key compatibility; retain original cleaning and crop geometry')
+    ap.add_argument('--images-first', action='store_true', help='save source-proven complete question images while unavailable keys or grading remain held')
     ap.add_argument('--key-base', metavar='KEY_PDF', help='complete source key accompanying an explicitly selected final correction sheet')
     ap.add_argument('--add-key-policy', choices=('unresolved', 'original'), default='unresolved',
                     help='explicit adjudication for an Add correction marker; original keeps its matching base answer')
@@ -778,12 +849,21 @@ def main():
         key = key_from_file(args.key, args.dpi)
     why = gate(pages, questions, key)
     layout = getattr(args, '_source_layout', None)
+    images_ready, grading_issues = False, []
     if layout:
         evidence = {name: value for name, value in layout.items() if name != 'anchors_by_page'}
         evidence['question_count_detected'] = len(questions)
         (out / 'source_layout.json').write_text(json.dumps(evidence, indent=1))
         if len(questions) != layout['expected_count']:
             why.append('detected question count does not match the printed source declaration')
+    if args.images_first and why:
+        why, grading_issues = image_first_gate(pages, questions, key, layout,
+                                               getattr(args, '_source_types', {}), source_key)
+        images_ready = not why
+    elif args.images_first and layout and source_key and source_key.get('unresolved'):
+        image_why, grading_issues = image_first_gate(pages, questions, key, layout,
+                                                    getattr(args, '_source_types', {}), source_key)
+        images_ready = not image_why
     if why:
         out.mkdir(parents=True, exist_ok=True)
         msg = 'REFUSED - this upload does not meet the required format:\n' + '\n'.join(f'  - {w}' for w in why) + \
@@ -799,16 +879,35 @@ def main():
     make_crops(out, pages, questions)
     flagged = write_review(out, pages, questions)
     exam = [dict(number=q['number'], image=f"crops/Q{q['number']:03d}.png", answer=key.get(q['number'])) for q in questions]
-    for item in exam:
+    for item, question in zip(exam, questions):
         item.update(getattr(args, '_source_types', {}).get(item['number'], {}))
+        item['option_labels'] = list(question.get('option_labels', []))
+        kind = item.get('source_type')
+        if isinstance(kind, str) and kind.lower().replace('-', '_') in {
+                'single_choice', 'single_correct', 'multiple_correct', 'multi_correct',
+                'multiple_select', 'multi_select', 'mcq_single', 'mcq_multi'}:
+            labels = set(item['option_labels'])
+            if labels == {'1', '2', '3', '4'}:
+                item['option_key_basis'] = 'one_based_options'
+            elif labels == {'A', 'B', 'C', 'D'}:
+                item['option_key_basis'] = 'letter_options'
     export = dict(source=src.name, count=len(exam), questions=exam)
+    if images_ready:
+        export.update(schema='modulus_image_exam_v1', extraction_state='images_ready',
+                      grading_ready=False, grading_issues=grading_issues,
+                      image_completeness={
+                          'status': 'source_sequence_complete',
+                          'expected_count': layout['expected_count'],
+                          'basis': 'printed_count_unique_existing_anchor_sequence_nonempty_parts'})
     if source_key is not None:
         export['source_key'] = {name: value for name, value in source_key.items() if name != 'key'}
     if layout:
         export['source_layout'] = evidence
     (out / 'exam.json').write_text(json.dumps(export, indent=1))
     print((out / 'REPORT.txt').read_text())
-    if source_key and source_key.get('unresolved'):
+    if images_ready:
+        print(f'IMAGES READY: {len(questions)} complete source question images saved; grading remains held. Source answers were not invented.')
+    elif source_key and source_key.get('unresolved'):
         print(f'EXTRACTED: {len(questions)} question images; source-key adjudication remains unresolved. Exam grading is held.')
     else:
         print(f'ACCEPTED: {len(questions)} questions, each with its answer. {len(flagged)} flagged. Open {out}/review.html')

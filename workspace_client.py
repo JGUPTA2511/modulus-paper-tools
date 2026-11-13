@@ -38,6 +38,7 @@ MAX_EXPANDED = 256 * 1024 * 1024
 SKIP = '[skip ci] [skip netlify]'
 HERE = Path(__file__).resolve().parent
 APPROVED_LEGACY_CROPPER_SHA256 = 'adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc'
+APPROVED_SOURCE_READER_CROPPER_SHA256 = 'b83d3f491e4ff5e988494f7e9954cccb7b9fe6b6e26c973ddc6c64819982da4e'
 ID_RE = re.compile(r'^[A-Z0-9][A-Z0-9_-]{0,79}$')
 
 class WorkspaceError(Exception):
@@ -188,6 +189,48 @@ def input_pdf(path):
     return path
 
 
+def source_response_type(question):
+    """Read explicit response metadata without examining the answer value."""
+    aliases = {
+        'numerical': 'numerical', 'numeric': 'numerical', 'numerical_value': 'numerical',
+        'integer': 'numerical', 'integer_type': 'numerical',
+        'single_choice': 'single_choice', 'single_correct': 'single_choice',
+        'mcq_single': 'single_choice', 'mcq': 'single_choice',
+        'multiple_correct': 'multiple_correct', 'multi_correct': 'multiple_correct',
+        'multiple_select': 'multiple_correct', 'multi_select': 'multiple_correct',
+        'mcq_multi': 'multiple_correct', 'multiple_choice_multiple_correct': 'multiple_correct',
+    }
+    declared = set()
+    for field in ('source_type', 'question_type', 'response_type', 'type'):
+        value = question.get(field)
+        if isinstance(value, str):
+            kind = aliases.get(value.strip().lower().replace('-', '_').replace(' ', '_'))
+            if kind:
+                declared.add(kind)
+    if len(declared) > 1:
+        raise WorkspaceError('Conflicting explicit question response types.')
+    return next(iter(declared), None)
+
+
+def valid_source_answer(answer, response_type):
+    """Validate structure only; retain source scalars and typed option arrays."""
+    if isinstance(answer, list):
+        if response_type != 'multiple_correct' or not answer:
+            return False
+        normalized = []
+        for item in answer:
+            if isinstance(item, bool) or not isinstance(item, (int, str)):
+                return False
+            value = str(item).strip().upper()
+            if not re.fullmatch(r'[1-4A-D]', value):
+                return False
+            normalized.append(str(ord(value) - ord('A') + 1) if value in 'ABCD' else value)
+        return len(normalized) == len(set(normalized))
+    return (isinstance(answer, (str, int, float)) and not isinstance(answer, bool)
+            and not (isinstance(answer, float) and not math.isfinite(answer))
+            and bool(str(answer).strip()))
+
+
 def validate_export(source):
     """Verify references and readable PNGs, not mathematical/cropping correctness."""
     from PIL import Image
@@ -216,14 +259,29 @@ def validate_export(source):
                 raise WorkspaceError('Malformed question records.')
             if any(type(q.get('number')) is not int for q in rows) or [q['number'] for q in rows] != list(range(1, count + 1)):
                 raise WorkspaceError('Missing, duplicate or out-of-order question numbers.')
+            images_ready = (data.get('schema') == 'modulus_image_exam_v1'
+                            and data.get('extraction_state') == 'images_ready')
+            if data.get('extraction_state') == 'images_ready' or data.get('schema') == 'modulus_image_exam_v1':
+                proof = data.get('image_completeness', {})
+                if (not images_ready or data.get('grading_ready') is not False
+                        or not isinstance(proof, dict)
+                        or proof.get('status') != 'source_sequence_complete'
+                        or proof.get('basis') != 'printed_count_unique_existing_anchor_sequence_nonempty_parts'
+                        or type(proof.get('expected_count')) is not int
+                        or proof['expected_count'] != count):
+                    raise WorkspaceError('Malformed images-ready source-completeness declaration.')
             expected = set()
+            missing_answers = []
             for q in rows:
                 n = q['number']
                 name = f'crops/Q{n:03d}.png'
                 if q.get('image') != name or name not in names:
                     raise WorkspaceError(f'Q{n}: missing or mismatched image.')
                 answer = q.get('answer')
-                if not isinstance(answer, (str, int, float)) or isinstance(answer, bool) or (isinstance(answer, float) and not math.isfinite(answer)) or not str(answer).strip():
+                response_type = source_response_type(q)
+                if answer is None and images_ready:
+                    missing_answers.append(n)
+                elif not valid_source_answer(answer, response_type):
                     raise WorkspaceError(f'Q{n}: missing/invalid source answer.')
                 body = z.read(name)
                 if not body.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -242,10 +300,19 @@ def validate_export(source):
                 raise WorkspaceError('ZIP checksum error.')
             report = z.read('REPORT.txt').decode('utf-8', errors='replace') if 'REPORT.txt' in names else ''
             check = {'structural_check': 'passed', 'questions': count,
-                'images': count, 'answers': count, 'export_sha256': sha(source.read_bytes()),
+                'images': count, 'answers': count - len(missing_answers), 'export_sha256': sha(source.read_bytes()),
                 'answer_status': 'source_transcribed_unverified',
                 'crop_visual_review': 'not_performed_by_sync_tool',
                 'cropper_report': report[:20000]}
+            if images_ready:
+                grading_issues = data.get('grading_issues', [])
+                if not isinstance(grading_issues, list):
+                    raise WorkspaceError('Malformed image-only grading issues.')
+                check.update(extraction_state='images_ready', grading_ready=False, gradeable=False,
+                             exam_launch_ready=False, image_completeness=data['image_completeness'],
+                             grading_issues=grading_issues,
+                             missing_source_answers=missing_answers,
+                             answer_status='missing_source_answers' if missing_answers else 'source_transcribed_unverified')
             for field in ('source_key', 'source_layout'):
                 if field in data:
                     if not isinstance(data[field], dict):
@@ -259,7 +326,7 @@ def validate_export(source):
                 check.update(answer_status='source_adjudication_required',
                              unresolved_source_adjudication=unresolved,
                              marking_state='source_adjudication_required',
-                             exam_launch_ready=False)
+                             grading_ready=False, gradeable=False, exam_launch_ready=False)
             return data, check
     except WorkspaceError:
         raise
@@ -373,7 +440,7 @@ def _sync_job(folder, api=None, queue_on_error=True):
     pid = paper_id(job.get('paper_id'))
     if pid != folder.name or status.get('paper_id') != pid:
         raise WorkspaceError('Job/status paper ID does not match its local folder.')
-    if status.get('state') not in ('processing', 'held', 'ready_for_integration'):
+    if status.get('state') not in ('processing', 'held', 'images_ready', 'ready_for_integration'):
         raise WorkspaceError('Invalid Mac processing state.')
     inputs = job.get('inputs')
     if not isinstance(inputs, dict) or set(inputs) - {'questions', 'answer_key', 'solutions'}:
@@ -393,7 +460,7 @@ def _sync_job(folder, api=None, queue_on_error=True):
             raise WorkspaceError('Original input changed; restore the immutable source before syncing: ' + role)
         validated[path] = body
         allowed.append(path)
-    if status.get('state') == 'ready_for_integration':
+    if status.get('state') in ('images_ready', 'ready_for_integration'):
         cached_run(folder)  # Refuse missing or changed completed artifacts.
         run_record = json.loads((folder / 'runs' / status['run_id'] / 'run.json').read_text())
         if run_record.get('input_manifest_sha256') != sha(manifest_body):
@@ -407,7 +474,7 @@ def _sync_job(folder, api=None, queue_on_error=True):
         run = folder / 'runs' / rid
         if run.is_symlink():
             raise WorkspaceError('Symlink run directory refused.')
-        names = ('export.zip', 'exam.json', 'checks.json', 'run.json') if status['state'] == 'ready_for_integration' else ('REFUSED.txt',)
+        names = ('export.zip', 'exam.json', 'checks.json', 'run.json') if status['state'] in ('images_ready', 'ready_for_integration') else ('REFUSED.txt',)
         allowed += [run / n for n in names if (run / n).is_file()]
     files = {}
     for p in allowed:
@@ -540,9 +607,18 @@ def finish_run(folder, job, run, archive):
                  'exam_launch_ready': False}
     if check.get('unresolved_source_adjudication'):
         extra.update(integration_state='held_pending_source_key_adjudication',
-                     exam_launch_ready=False, marking_state='source_adjudication_required',
+                     exam_launch_ready=False, grading_ready=False, gradeable=False,
+                     marking_state='source_adjudication_required',
                      unresolved_source_adjudication=check['unresolved_source_adjudication'])
-    record_status(folder, job, 'ready_for_integration', run.name, questions=data['count'], **extra,
+    images_ready = check.get('extraction_state') == 'images_ready'
+    if images_ready:
+        extra.update(extraction_state='images_ready', grading_ready=False, gradeable=False,
+                     exam_launch_ready=False, missing_source_answers=check['missing_source_answers'])
+        if not check.get('unresolved_source_adjudication'):
+            extra['integration_state'] = ('held_pending_source_answers' if check['missing_source_answers']
+                                          else 'held_pending_source_type_marking_and_completeness_validation')
+    record_status(folder, job, 'images_ready' if images_ready else 'ready_for_integration', run.name,
+        questions=data['count'], **extra,
         next_action='Assistant: identify source sections/types, map supplied solutions, validate selected marking, test portal integration.')
 
 
@@ -551,7 +627,7 @@ def cached_run(folder, export_sha=None):
     if not status.is_file():
         return False
     state = json.loads(status.read_text())
-    if state.get('state') != 'ready_for_integration':
+    if state.get('state') not in ('images_ready', 'ready_for_integration'):
         return False
     rid = state.get('run_id')
     if not isinstance(rid, str) or not rid or PurePosixPath(rid).name != rid or rid in ('.', '..') or '\\' in rid:
@@ -566,12 +642,14 @@ def cached_run(folder, export_sha=None):
     if sha((run.parent / 'export.zip').read_bytes()) != previous.get('export_sha256'):
         raise WorkspaceError('Completed export changed; original run retained. Restore it before retrying.')
     data, checks = validate_export(run.parent / 'export.zip')
+    if state.get('state') == 'images_ready' and checks.get('extraction_state') != 'images_ready':
+        raise WorkspaceError('Saved image-only state does not match its immutable export.')
     if json.loads((run.parent / 'exam.json').read_text()) != data or json.loads((run.parent / 'checks.json').read_text()).get('export_sha256') != checks['export_sha256']:
         raise WorkspaceError('Completed run metadata changed; restore it before retrying.')
     if export_sha:
         return previous.get('export_sha256') == export_sha
     compatible = {sha((HERE / 'question_boundaries.py').read_bytes()),
-                  APPROVED_LEGACY_CROPPER_SHA256}
+                  APPROVED_LEGACY_CROPPER_SHA256, APPROVED_SOURCE_READER_CROPPER_SHA256}
     return (previous.get('input_manifest_sha256') == sha((folder / 'job.json').read_bytes())
             and previous.get('cropper_sha256') in compatible)
 
@@ -656,7 +734,7 @@ def _process(args):
     output = run / 'local_crop_output'
     command = [sys.executable, str(HERE / 'question_boundaries.py'),
                str(folder / 'input/questions.pdf'), '--out', str(output), '--source-compat',
-               '--add-key-policy', 'original']
+               '--images-first', '--add-key-policy', 'original']
     if key:
         command += ['--key', str(folder / 'input/answer_key.pdf')]
         base_key = associated_base_key(folder, job)
@@ -1839,6 +1917,11 @@ def run_batch(args, entries=None):
                 row['integration_state'] = 'held_pending_source_key_adjudication'
                 row['exam_launch_ready'] = False
                 row['unresolved_source_adjudication'] = current['unresolved_source_adjudication']
+            if current.get('state') == 'images_ready':
+                row.update(extraction_state='images_ready', grading_ready=False, gradeable=False,
+                           exam_launch_ready=False,
+                           missing_source_answers=current.get('missing_source_answers', []),
+                           integration_state=current.get('integration_state', 'held_pending_source_answers'))
             if args.offline:
                 row.update(outcome='already processed' if reused else 'upload failed/local-only',
                            reason='Local results retained; offline mode selected.')
@@ -1857,6 +1940,8 @@ def run_batch(args, entries=None):
             if row.get('integration_state'):
                 hold = ('Exam grading held: finalized source-key entries require clarification.'
                         if row.get('unresolved_source_adjudication') else
+                        'Question images saved; grading held until source answers are supplied.'
+                        if row.get('missing_source_answers') else
                         'Exam launch held: validate source sections, completeness and marking in the required Main/Advanced flow.')
                 row['reason'] = (row['reason'] + ' ' if row['reason'] else '') + hold
         except Exception as exc:
