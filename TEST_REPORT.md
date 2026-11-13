@@ -1,4 +1,21 @@
-# Batch verification — 13 November 2026
+# Original filenames and durable upload queue — 13 November 2026
+
+Executed in the Linux cloud workspace with synthetic fixtures only:
+
+- `python -m unittest discover -s tests -v`: **114 tests passed** (70 existing/batch/job safety, 24 original-filename, 19 upload queue, 1 offline launcher).
+- Python compilation for client, unchanged cropper and new tests; shell syntax for both launchers; `git diff --check`: passed.
+- Tested client Git blob: `40d48a31225ea86ffda561b0936efbde8b6cff58`.
+- Cropper SHA-256 unchanged: `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+New tests cover arbitrary PDF/ZIP names including spaces/non-ASCII, explicit numbered selections saved outside inputs with hashes, no repeated prompts for unchanged selections, changed inventory/hash refusal, mapping/ignore safety, symlink/FIFO rejection, unchanged filenames/bytes, original numerical zero/passage metadata, ambiguous associations never guessed, Word-only refusal and untouched Word originals beside PDFs. An actual offline CLI subprocess reuses a synthetic existing export without cropping.
+
+Queue tests simulate real client/API failure paths to persist pending records, retry without recropping, avoid duplicate commits, continue other papers, preserve newer concurrent enqueue revisions, enforce private targets and safe paths, guard multiple drainers, pause retries during processing and persist bounded backoff. Worker timing is tested with controlled events/mocks. Existing per-paper locks and integrity checks remain in force.
+
+An actual Bash subprocess exercised a temporary launcher with stubbed programs, failed update/login commands and installed local client/venv. It reached interactive processing despite GitHub sign-in failure. This proves the shell fallback logic under simulation, not real Homebrew installation/browser login on a Mac.
+
+No real source papers, real paper transfers, actual Mac operation, new cropper execution, Actions processing, paid API calls, portal promotion or deployment were performed. Queue records resume while the launcher is open/idle or on its next start; no external scheduler/service was installed. GitHub Actions minutes are not required for local cropping or GitHub API file uploads. Earlier workflow-setting access limits remain below. The screenshot supplied by the owner showed an older waiting prompt with many flagged crops; it is not evidence that the current updater/queue ran or that those crops are usable.
+
+# Earlier batch verification — 13 November 2026
 
 Executed in the assistant's Linux cloud workspace, using synthetic fixtures only.
 

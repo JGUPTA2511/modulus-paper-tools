@@ -39,6 +39,8 @@ fi
 if ! gh auth status --hostname github.com >/dev/null 2>&1; then
   echo 'ONE-TIME CONNECTION: sign in to your GitHub account in the browser.'
   echo 'Do not paste passwords or access tokens into a chat.'
-  gh auth login --hostname github.com --web --git-protocol https
+  if ! gh auth login --hostname github.com --web --git-protocol https; then
+    echo 'GitHub sign-in/connection is unavailable. Local processing continues; failed uploads will be queued.'
+  fi
 fi
 python3 "$HERE/workspace_client.py" --interactive

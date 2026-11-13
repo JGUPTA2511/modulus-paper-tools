@@ -286,16 +286,16 @@ class GitHub:
         raise WorkspaceError('Workspace kept changing. Local files kept; retry sync.')
 
 
-def sync_job(folder, api=None):
+def sync_job(folder, api=None, queue_on_error=True):
     folder = Path(folder).expanduser()
     if folder.is_symlink():
         raise WorkspaceError('Symlink job folder refused.')
     folder = folder.resolve()
     with job_lock(folder.parent, folder.name):
-        return _sync_job(folder, api)
+        return _sync_job(folder, api, queue_on_error=queue_on_error)
 
 
-def _sync_job(folder, api=None):
+def _sync_job(folder, api=None, queue_on_error=True):
     folder = Path(folder).expanduser().resolve()
     manifest_path = folder / 'job.json'
     status_path = folder / 'status.json'
@@ -351,7 +351,16 @@ def _sync_job(folder, api=None):
         if p.is_symlink() or folder not in p.resolve().parents:
             raise WorkspaceError('Symlink/outside path refused.')
         files[f'paper_jobs/{pid}/' + p.relative_to(folder).as_posix()] = validated[p] if p in validated else p.read_bytes()
-    result = (api or GitHub()).upload(files, 'Sync paper ' + pid + ': ' + status['state'])
+    try:
+        result = (api or GitHub()).upload(files, 'Sync paper ' + pid + ': ' + status['state'])
+    except Exception as exc:
+        if queue_on_error:
+            try:
+                queue_sync(folder, str(exc))
+                print('QUEUED: ' + pid + ' — upload will retry while the launcher is open or on its next launch.')
+            except (WorkspaceError, OSError, ValueError) as queue_exc:
+                print('Local results kept; upload queue could not be saved: ' + str(queue_exc))
+        raise
     # Receipt is local only: no ever-changing timestamps to cause repeated commits.
     save_json(folder / 'sync_receipt.json', dict(result, synced_at=now(), branch=BRANCH))
     print('SYNCED: ' + pid + ' | commit ' + result['commit'][:10])
@@ -560,6 +569,157 @@ def _attach(args):
     return folder
 
 
+def _upload_queue_dir(root, create=False):
+    root = Path(root).expanduser().resolve()
+    directory = root / '.upload_queue'
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise WorkspaceError('Unsafe local upload queue directory.')
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+@contextmanager
+def _upload_queue_lock(root):
+    """Hold only for local record changes, never during a network request."""
+    import fcntl
+    directory = _upload_queue_dir(root, create=True)
+    path = directory / '.lock'
+    if path.is_symlink():
+        raise WorkspaceError('Unsafe local upload queue lock.')
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    with os.fdopen(os.open(path, flags, 0o600), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield directory
+
+
+def _read_upload_record(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+        raise WorkspaceError('Unsafe or oversized local upload queue record.')
+    item = json.loads(path.read_text())
+    pid = paper_id(path.stem)
+    if (not isinstance(item, dict) or item.get('schema') != 'modulus_upload_queue_v1'
+            or item.get('paper_id') != pid
+            or not isinstance(item.get('revision'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', item['revision'])
+            or type(item.get('attempts')) is not int or item['attempts'] < 0
+            or type(item.get('next_retry_at', 0)) not in (int, float)
+            or not math.isfinite(item.get('next_retry_at', 0)) or item.get('next_retry_at', 0) < 0):
+        raise WorkspaceError('Malformed local upload queue record.')
+    return item
+
+
+def queue_sync(folder, reason=''):
+    """Persist a pending API upload; no cropping, hosted processing or deployment."""
+    folder = Path(folder).expanduser()
+    if folder.is_symlink() or not folder.is_dir():
+        raise WorkspaceError('Unsafe queued paper folder.')
+    folder = folder.resolve()
+    pid = paper_id(folder.name)
+    for name in ('job.json', 'status.json'):
+        path = folder / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FILE:
+            raise WorkspaceError('Queued paper is missing a safe job/status record.')
+        item = json.loads(path.read_text())
+        if not isinstance(item, dict) or item.get('paper_id') != pid:
+            raise WorkspaceError('Queued paper ID does not match its folder.')
+    with _upload_queue_lock(folder.parent) as directory:
+        path = directory / (pid + '.json')
+        previous = _read_upload_record(path) if path.exists() or path.is_symlink() else {}
+        record = {'schema': 'modulus_upload_queue_v1', 'paper_id': pid,
+                  'revision': uuid.uuid4().hex, 'created_at': previous.get('created_at', now()),
+                  'updated_at': now(), 'attempts': previous.get('attempts', 0),
+                  'last_error': str(reason)[:1000], 'next_retry_at': 0, 'state': 'pending'}
+        save_json(path, record)
+    return record
+
+
+def drain_queue(root, api=None, force=True):
+    """Try each saved upload once; retain failures and never rerun the cropper."""
+    root = Path(root).expanduser().resolve()
+    directory = _upload_queue_dir(root)
+    if not directory.exists():
+        return []
+    # Multiple launchers may be open. Only one drainer sends queued uploads;
+    # enqueue operations still proceed under the separate brief record lock.
+    import fcntl
+    guard = directory / '.drain.lock'
+    if guard.is_symlink():
+        raise WorkspaceError('Unsafe local queue worker lock.')
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    results = []
+    with os.fdopen(os.open(guard, flags, 0o600), 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        for path in sorted(directory.glob('*.json')):
+            row = {'paper_id': path.stem, 'outcome': 'queued'}
+            results.append(row)
+            record = None
+            try:
+                with _upload_queue_lock(root):
+                    record = _read_upload_record(path)
+                pid = record['paper_id']
+                next_retry = record.get('next_retry_at', 0)
+                if not force and isinstance(next_retry, (int, float)) and next_retry > dt.datetime.now(dt.timezone.utc).timestamp():
+                    row['next_retry_at'] = next_retry
+                    continue
+                # Resolve the target from validated ID, never from queue-provided paths.
+                folder = root / pid
+                if folder.is_symlink() or not folder.is_dir():
+                    raise WorkspaceError('Queued paper folder is missing or unsafe.')
+                result = sync_job(folder, api, queue_on_error=False)
+                with _upload_queue_lock(root):
+                    # A newer enqueue may have arrived while this request ran.
+                    # Remove only the exact revision that has now been uploaded.
+                    current = _read_upload_record(path) if path.exists() or path.is_symlink() else None
+                    if current and current['revision'] == record['revision']:
+                        path.unlink()
+                row.update(outcome='synced', commit=result['commit'])
+            except Exception as exc:
+                row['reason'] = str(exc)[:1000]
+                if record is not None:
+                    try:
+                        with _upload_queue_lock(root):
+                            current = _read_upload_record(path) if path.exists() or path.is_symlink() else None
+                            if current and current['revision'] == record['revision']:
+                                attempts = current['attempts'] + 1
+                                delay = min(60 * (2 ** min(attempts - 1, 6)), 3600)
+                                current.update(attempts=attempts, updated_at=now(),
+                                               last_error=str(exc)[:1000],
+                                               next_retry_at=dt.datetime.now(dt.timezone.utc).timestamp() + delay)
+                                save_json(path, current)
+                    except (WorkspaceError, OSError, ValueError):
+                        pass  # Never replace an unsafe/concurrently edited record.
+    return results
+
+
+def start_queue_worker(root, interval=60, pause_event=None):
+    """Resume saved uploads while this launcher is open; closing keeps the queue."""
+    import threading
+    stop = threading.Event()
+    root = Path(root).expanduser().resolve()
+
+    def retry():
+        while not stop.is_set():
+            try:
+                # Avoid authentication/API requests when there is no pending work.
+                directory = _upload_queue_dir(root)
+                if (pause_event is None or not pause_event.is_set()) and directory.is_dir() and any(directory.glob('*.json')):
+                    drain_queue(root, force=False)
+            except Exception:
+                # The interactive/local processing flow must keep working.
+                # Existing queue records retain the actionable upload error.
+                pass
+            if stop.wait(interval):
+                break
+
+    thread = threading.Thread(target=retry, name='modulus-upload-queue', daemon=True)
+    thread.start()
+    return stop, thread
+
+
 PROFILES = ('unspecified', 'jee-main-mock')
 
 
@@ -591,7 +751,151 @@ def batch_profile(value):
     return value
 
 
-def discover_batch(source, root, profile='unspecified', overrides=None):
+FILE_ROLES = {'questions': 'questions.pdf', 'answer_key': 'answer_key.pdf',
+              'solutions': 'solutions.pdf', 'export': 'export.zip'}
+
+
+def selection_path(source, root):
+    directory = Path(root).expanduser().resolve() / '.batch_selections'
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise WorkspaceError('Unsafe saved-selection directory.')
+    path = directory / (sha(str(Path(source).resolve()).encode()) + '.json')
+    if path.is_symlink():
+        raise WorkspaceError('Unsafe saved-selection file.')
+    return path
+
+
+def read_selections(source, root):
+    path = selection_path(source, root)
+    if not path.exists():
+        return {}
+    if not path.is_file() or path.stat().st_size > 1024 * 1024:
+        raise WorkspaceError('Invalid/oversized saved file selections.')
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get('schema') != 'modulus_batch_selections_v1' or not isinstance(data.get('folders'), dict):
+        raise WorkspaceError('Invalid saved file selections.')
+    return data['folders']
+
+
+def remember_selection(source, root, directory, fingerprint, mapping, ignored):
+    # Merge after acquiring the lock, so selections for another paper are kept.
+    with job_lock(root, 'BATCH-SELECTIONS'):
+        selections = read_selections(source, root)
+        selections[directory.name] = {'fingerprint': fingerprint, 'files': mapping, 'ignore': ignored}
+        save_json(selection_path(source, root), {'schema': 'modulus_batch_selections_v1', 'folders': selections})
+
+
+def checked_selection(candidates, mapping, ignored):
+    if not isinstance(mapping, dict) or set(mapping) - set(FILE_ROLES):
+        raise WorkspaceError('File selection roles must be questions, answer_key, solutions or export.')
+    if not isinstance(ignored, list) or any(not isinstance(name, str) for name in ignored):
+        raise WorkspaceError('Ignored files must be a list of filenames.')
+    used = []
+    names = {}
+    for role, name in mapping.items():
+        if not isinstance(name, str) or not name or PurePosixPath(name).name != name or '\\' in name or ':' in name:
+            raise WorkspaceError('Unsafe selected filename; choose a file inside this paper folder.')
+        if name not in candidates or candidates[name].is_symlink():
+            raise WorkspaceError('Selected file is missing or unsafe: ' + name)
+        expected = '.zip' if role == 'export' else '.pdf'
+        if candidates[name].suffix.lower() != expected:
+            raise WorkspaceError('Wrong file format for ' + role + ': ' + name)
+        used.append(name)
+        names[FILE_ROLES[role]] = candidates[name]
+    if len(used + ignored) != len(set(used + ignored)):
+        raise WorkspaceError('A file cannot have multiple roles or also be ignored.')
+    if set(used + ignored) != set(candidates):
+        raise WorkspaceError('Ambiguous input: every PDF/ZIP must be selected or explicitly ignored. Keep original filenames; select files in the Mac launcher.')
+    if not set(mapping) & {'questions', 'export'}:
+        raise WorkspaceError('A question PDF or existing export must be selected.')
+    return names
+
+
+def ask_file_roles(directory, candidates, initial):
+    print('\nSelect files for ' + directory.name + ' — original filenames stay unchanged.')
+    numbered = sorted(candidates, key=lambda name: (name.casefold(), name))
+    for index, name in enumerate(numbered, 1):
+        print('  ' + str(index) + ': ' + repr(name))
+    mapping = dict(initial)
+    for role in ('export', 'questions', 'answer_key', 'solutions'):
+        if role in mapping:
+            continue
+        suffix = '.zip' if role == 'export' else '.pdf'
+        choices = {str(i): name for i, name in enumerate(numbered, 1)
+                   if name not in mapping.values() and candidates[name].suffix.lower() == suffix}
+        if not choices:
+            continue
+        required = role == 'questions' and 'export' not in mapping
+        while True:
+            label = {'export': 'Existing cropped EXPORT ZIP', 'questions': 'QUESTION paper PDF',
+                     'answer_key': 'Separate ANSWER KEY PDF', 'solutions': 'Separate SOLUTIONS PDF'}[role]
+            answer = input(label + ' number (' + ', '.join(choices) +
+                           ('; Enter holds this paper' if required else '; Enter skips') + ') > ').strip()
+            if not answer:
+                if required:
+                    raise WorkspaceError('Paper held: no question PDF selected. Original filenames kept.')
+                break
+            if answer in choices:
+                mapping[role] = choices[answer]
+                break
+            print('Choose one of the listed numbers, or press Enter.')
+    ignored = [name for name in numbered if name not in mapping.values()]
+    if ignored:
+        print('Unselected files: ' + ', '.join(repr(name) for name in ignored))
+        if input('Leave these files unused? y / Enter holds this paper > ').strip().lower() != 'y':
+            raise WorkspaceError('Paper held: file associations were not selected; original files kept.')
+    checked_selection(candidates, mapping, ignored)
+    return mapping, ignored
+
+
+def associate_files(source, root, directory, candidates, settings, select_files=False):
+    # Fingerprints invalidate saved choices even when filenames are unchanged.
+    fingerprint = {}
+    for name, path in candidates.items():
+        if path.stat().st_size > MAX_FILE:
+            raise WorkspaceError('Input exceeds the 24 MiB per-file limit: ' + name)
+        fingerprint[name] = sha(path.read_bytes())
+    if 'files' in settings:
+        return checked_selection(candidates, settings['files'], settings.get('ignore', []))
+    if 'ignore' in settings:
+        raise WorkspaceError('paper.json ignore requires explicit files selections.')
+    saved = read_selections(source, root).get(directory.name)
+    if saved is not None:
+        if not isinstance(saved, dict):
+            raise WorkspaceError('Malformed saved file selection.')
+        if saved.get('fingerprint') == fingerprint:
+            return checked_selection(candidates, saved.get('files'), saved.get('ignore', []))
+        if not select_files:
+            raise WorkspaceError('Saved file selections changed. Use the Mac launcher to select again; changed originals need a new paper ID.')
+    initial = {}
+    for role, canonical in FILE_ROLES.items():
+        matches = [name for name in candidates if name.lower() == canonical]
+        if len(matches) > 1:
+            raise WorkspaceError('Duplicate input role: ' + canonical)
+        if matches:
+            initial[role] = matches[0]
+    # A single ZIP has a verifiable export structure, irrespective of its name.
+    zips = [name for name in candidates if candidates[name].suffix.lower() == '.zip']
+    if 'export' not in initial and len(zips) == 1:
+        validate_export(candidates[zips[0]])
+        initial['export'] = zips[0]
+    remaining = [name for name in candidates if candidates[name].suffix.lower() == '.pdf' and name not in initial.values()]
+    if 'questions' not in initial and 'export' not in initial and len(remaining) == 1:
+        initial['questions'] = remaining[0]
+    if saved is None and set(initial.values()) == set(candidates):
+        return checked_selection(candidates, initial, [])
+    if not select_files:
+        raise WorkspaceError('Ambiguous input: select question/key/solutions files in the Mac launcher, or set paper.json files; no renaming needed.')
+    mapping, ignored = ask_file_roles(directory, candidates, initial)
+    # Validate the actual selected contents before remembering a selection.
+    names = checked_selection(candidates, mapping, ignored)
+    for canonical, path in names.items():
+        validate_export(path) if canonical == 'export.zip' else strict_pdf(path)
+    remember_selection(source, root, directory, fingerprint, mapping, ignored)
+    return names
+
+
+def discover_batch(source, root, profile='unspecified', overrides=None, select_files=False):
     """Read-only discovery. No guessed associations, output directories or cropping."""
     source = Path(source).expanduser()
     if source.is_symlink() or not source.is_dir():
@@ -612,32 +916,38 @@ def discover_batch(source, root, profile='unspecified', overrides=None):
         try:
             if directory.is_symlink() or not directory.is_dir():
                 raise WorkspaceError('Expected one real subfolder per paper; loose files/symlinks are not processed.')
+            settings = {}
             config = directory / 'paper.json'
             if config.exists() or config.is_symlink():
                 if config.is_symlink() or not config.is_file() or config.stat().st_size > 16384:
                     raise WorkspaceError('Unsafe or oversized paper.json.')
                 settings = json.loads(config.read_text())
-                if not isinstance(settings, dict) or set(settings) - {'paper_id', 'profile'}:
-                    raise WorkspaceError('paper.json accepts only paper_id and profile.')
+                if not isinstance(settings, dict) or set(settings) - {'paper_id', 'profile', 'files', 'ignore'}:
+                    raise WorkspaceError('paper.json accepts only paper_id, profile, files and ignore.')
                 item['paper_id'] = paper_id(settings.get('paper_id', item['paper_id']))
                 item['profile'] = batch_profile(settings.get('profile', profile))
             paper_id(item['paper_id'])
             item['inventory'] = sorted(p.name for p in directory.iterdir() if not p.name.startswith('.'))
-            names = {}
+            candidates = {}
+            documents = []
             for p in directory.iterdir():
                 if p.name.startswith('.') or p.name == 'paper.json':
                     continue
                 if p.is_symlink() or p.is_dir():
                     raise WorkspaceError('Symlinks/nested input folders are not accepted: ' + p.name)
-                name = p.name.lower()
+                if not p.is_file():
+                    raise WorkspaceError('Special/nonregular input files are not accepted: ' + p.name)
+                if p.suffix.lower() in ('.doc', '.docx'):
+                    documents.append(p.name)
+                    continue
                 if p.suffix.lower() in ('.pdf', '.zip'):
-                    if name not in ('questions.pdf', 'answer_key.pdf', 'solutions.pdf', 'export.zip'):
-                        raise WorkspaceError('Ambiguous input ' + p.name + '; use questions.pdf, answer_key.pdf, solutions.pdf or export.zip.')
-                    if name in names:
-                        raise WorkspaceError('Duplicate input role: ' + name)
-                    names[name] = p
-            if 'questions.pdf' not in names and 'export.zip' not in names:
-                raise WorkspaceError('Missing questions.pdf or export.zip.')
+                    candidates[p.name] = p
+            if not candidates:
+                if documents:
+                    raise WorkspaceError('Word documents need a PDF copy before processing; originals stay unchanged: ' + ', '.join(documents))
+                raise WorkspaceError('Missing question PDF or existing export ZIP.')
+            item['unprocessed_documents'] = documents
+            names = associate_files(source, root, directory, candidates, settings, select_files)
             for name, p in names.items():
                 if name == 'export.zip':
                     validate_export(p)
@@ -670,10 +980,12 @@ def show_batch(entries):
             print('  ' + item['paper_id'] + ' | HELD: ' + item['reason'])
         else:
             files = item['files']
-            mode = 'reuse export unchanged' if 'export.zip' in files else 'crop questions.pdf'
+            mode = 'reuse export unchanged' if 'export.zip' in files else 'crop question PDF'
             key = 'separate key' if 'answer_key.pdf' in files else 'key from existing export' if 'export.zip' in files else 'embedded key (if present)'
             solutions = 'solutions stored, not matched' if 'solutions.pdf' in files else 'no solutions supplied'
-            print('  ' + item['paper_id'] + ' | ' + mode + ' | ' + key + ' | ' + solutions + ' | profile=' + item['profile'])
+            print('  ' + item['paper_id'] + ' | ' + ', '.join(role.rsplit('.', 1)[0] + ': ' + Path(path).name for role, path in files.items()) + ' | ' + mode + ' | ' + key + ' | ' + solutions + ' | profile=' + item['profile'])
+            if item.get('unprocessed_documents'):
+                print('    Word originals left unused and unchanged: ' + ', '.join(item['unprocessed_documents']))
 
 
 def run_batch(args, entries=None):
@@ -684,7 +996,8 @@ def run_batch(args, entries=None):
             raise WorkspaceError('Use each --paper-profile ID=PROFILE once.')
         overrides[pid] = batch_profile(profile)
     if entries is None:
-        entries = discover_batch(args.source, args.root, args.profile, overrides)
+        entries = discover_batch(args.source, args.root, args.profile, overrides,
+                                 select_files=getattr(args, 'select_files', False))
         show_batch(entries)
     report_dir = Path(args.root).expanduser().resolve() / '.batch_reports'
     if report_dir.is_symlink() or (report_dir.exists() and not report_dir.is_dir()):
@@ -729,7 +1042,7 @@ def run_batch(args, entries=None):
                     row.update(outcome='already processed' if reused and receipt['changed'] == 0 else 'synced',
                                reason=None, commit=receipt['commit'])
                 except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
-                    row.update(outcome='upload failed/local-only', reason=str(exc) + ' Rerun this batch to retry; crops are saved.')
+                    row.update(outcome='upload failed/local-only', reason=str(exc) + ' Upload queued; crops are saved and retry without recropping.')
         except Exception as exc:
             row['reason'] = str(exc)
             # A refusal is useful to collaborators, but never hide it behind an upload error.
@@ -755,7 +1068,7 @@ def run_batch(args, entries=None):
 def interactive_batch(path):
     root = Path.home() / 'Modulus Papers'
     # Discover associations before requesting shared settings; paper.json overrides remain explicit.
-    entries = discover_batch(path, root)
+    entries = discover_batch(path, root, select_files=True)
     show_batch(entries)
     choice = input('\nMarking: y = JEE Main MOCK (+4/-1/0, 180 min); m = mixed; Enter = unspecified\n(per-paper paper.json profiles take precedence) > ').strip().lower()
     profile = 'jee-main-mock' if choice == 'y' else 'unspecified'
@@ -775,11 +1088,27 @@ def interactive_batch(path):
 
 
 def interactive():
+    import threading
+    pause = threading.Event()
+    stop, worker = start_queue_worker(Path.home() / 'Modulus Papers', pause_event=pause)
+    try:
+        _interactive_loop(pause)
+    finally:
+        stop.set()  # Pending jobs stay on disk; never wait on a network request here.
+
+
+def _interactive_loop(pause_uploads=None):
     print('\nMODULUS — one paper workspace, shared by Claude and ChatGPT')
+    print('Local Mac processing and file uploads do not use GitHub Actions minutes.')
+    print('Pending uploads retry while this window is open; closing keeps the saved queue.')
     print('Your PDFs/results go ONLY to the private repository. No Netlify deployment.')
     print('Drag a BATCH FOLDER, a question PDF OR an existing result ZIP. Type q to finish.')
     while True:
+        if pause_uploads is not None:
+            pause_uploads.clear()
         raw = input('\nBatch folder / question PDF / result ZIP > ').strip()
+        if pause_uploads is not None:
+            pause_uploads.set()
         if raw.lower() == 'q':
             return
         try:
@@ -789,6 +1118,8 @@ def interactive():
                 continue
             if path is None or not path.is_file():
                 raise WorkspaceError('File not found.')
+            if path.suffix.lower() not in ('.pdf', '.zip'):
+                raise WorkspaceError('Choose a PDF or existing export ZIP. Word documents need a PDF copy; keep the original unchanged.')
             default = re.sub(r'[^A-Z0-9_-]+', '-', path.stem.upper()).strip('-')[:70] or 'PAPER'
             default = re.sub(r'[_-]RESULT$', '', default)
             pid = paper_id(input('Paper name/code [' + default + '] > ').strip().upper() or default)
@@ -828,6 +1159,7 @@ def main():
     sub.add_argument('source', type=Path)
     sub.add_argument('--root', type=Path, default=Path.home() / 'Modulus Papers')
     sub.add_argument('--profile', choices=PROFILES, default='unspecified')
+    sub.add_argument('--select-files', action='store_true', help='Select ambiguous file roles without renaming originals.')
     sub.add_argument('--paper-profile', action='append', default=[], metavar='ID=PROFILE')
     sub.add_argument('--offline', action='store_true')
     sub.add_argument('--keep-color', action='store_true')
