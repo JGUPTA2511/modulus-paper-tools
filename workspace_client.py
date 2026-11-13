@@ -306,11 +306,15 @@ class GitHub:
         if not changed:
             return {'commit': head, 'changed': 0}
         entries = []
+        uploaded = set()
         for p, body in changed.items():
-            blob = self.call('git/blobs', 'POST', {'content': base64.b64encode(body).decode(), 'encoding': 'base64'})
-            if blob.get('sha') != desired[p]:
-                raise WorkspaceError('Uploaded blob hash mismatch: ' + p)
-            entries.append({'path': p, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+            blob_sha = desired[p]
+            if blob_sha not in uploaded:
+                blob = self.call('git/blobs', 'POST', {'content': base64.b64encode(body).decode(), 'encoding': 'base64'})
+                if blob.get('sha') != blob_sha:
+                    raise WorkspaceError('Uploaded blob hash mismatch: ' + p)
+                uploaded.add(blob_sha)
+            entries.append({'path': p, 'mode': '100644', 'type': 'blob', 'sha': blob_sha})
         for attempt in range(3):
             new_tree = self.call('git/trees', 'POST', {'base_tree': tree, 'tree': entries})['sha']
             commit = self.call('git/commits', 'POST', {'message': message + ' ' + SKIP,
@@ -411,7 +415,7 @@ def _sync_job(folder, api=None, queue_on_error=True):
 
 
 def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspecified',
-                export=None, keep_color=False, exam_intent=None):
+                export=None, keep_color=False, exam_intent=None, source_association=None):
     pid = paper_id(pid)
     root = Path(root).expanduser().resolve()
     folder = root / pid
@@ -437,6 +441,10 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
         if profile == 'jee-advanced-source' and exam_intent['exam_family'] == 'jee-main':
             raise WorkspaceError('Advanced interface cannot be assigned to a Main source paper.')
         job['exam_intent'] = exam_intent
+    if source_association is not None:
+        if not isinstance(source_association, dict):
+            raise WorkspaceError('Invalid source-file association metadata.')
+        job['source_association'] = source_association
     if export:
         p = Path(export)
         job['source_export'] = {'original_name': p.name, 'sha256': sha(p.read_bytes()),
@@ -451,16 +459,20 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
         raise WorkspaceError('Symlink manifest/input directory refused.')
     if path.exists():
         old = json.loads(path.read_text())
-        legacy_intent = dict(job)
-        legacy_intent.pop('exam_intent', None)
-        if 'exam_intent' not in old and old == legacy_intent:
-            job = old  # Do not rewrite an immutable legacy manifest for annotations.
+        identity, old_identity = dict(job), dict(old)
+        for annotation in ('exam_intent', 'source_association'):
+            identity.pop(annotation, None)
+            old_identity.pop(annotation, None)
+        if identity == old_identity:
+            job = old  # Keep existing annotations and immutable bytes for the same inputs/settings.
         # Legacy attach manifests did not contain the export identity. Reuse an
         # exact completed export without rewriting that immutable manifest.
         legacy = dict(job)
         legacy.pop('source_export', None)
         if 'exam_intent' not in old:
             legacy.pop('exam_intent', None)
+        if 'source_association' not in old:
+            legacy.pop('source_association', None)
         if export and 'source_export' not in old and old == legacy and cached_run(folder, job['source_export']['sha256']):
             job = old
         if old != job:
@@ -475,7 +487,8 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
                 raise WorkspaceError('Input collision; original retained.')
             if not dest.exists():
                 shutil.copy2(input_pdf(value), dest)
-    save_json(path, job)
+    if not path.exists():
+        save_json(path, job)
     return folder, job
 
 
@@ -573,7 +586,8 @@ def _process(args):
     if intent is None and args.profile in ('jee-main-mock', 'jee-advanced-source'):
         intent = inspect_exam_source(source=source)
     folder, job = prepare_job(args.root, args.paper_id, source, key, solutions,
-                              args.profile, keep_color=keep_color, exam_intent=intent)
+                              args.profile, keep_color=keep_color, exam_intent=intent,
+                              source_association=getattr(args, 'source_association', None))
     if cached_run(folder):
         print('Already processed with this cropper; reusing existing crops.')
         if not args.offline:
@@ -629,7 +643,8 @@ def _attach(args):
     folder, job = prepare_job(args.root, args.paper_id,
         source=getattr(args, 'source_pdf', None), key=getattr(args, 'key', None),
         solutions=getattr(args, 'solutions', None), profile=args.profile,
-        export=args.source, exam_intent=intent)
+        export=args.source, exam_intent=intent,
+        source_association=getattr(args, 'source_association', None))
     if cached_run(folder, sha(Path(args.source).read_bytes())):
         if not args.offline:
             _sync_job(folder)
@@ -916,9 +931,11 @@ SOURCE_EVIDENCE_TITLE_LINES = 12
 def _source_title_intent(text):
     """Read explicit first-page headings; filenames and answer values are irrelevant."""
     lines = [line for line in text.splitlines() if line.strip()][:SOURCE_EVIDENCE_TITLE_LINES]
-    label = re.compile(r'\bJ\.?\s*E\.?\s*E\.?\s*[-:]?\s*(Main|Advanced)\b', re.I)
+    label = re.compile(r'\bJ\.?\s*E\.?\s*E\.?\s*[-:]?\s*(?:\(\s*(Main|Advanced)\s*\)|(Main|Advanced)\b)', re.I)
     evidence = [line for line in lines if label.search(line)]
-    families = {'jee-' + match.group(1).lower() for line in evidence for match in label.finditer(line)}
+    families = {'jee-' + (match.group(1) or match.group(2)).lower() for line in evidence for match in label.finditer(line)}
+    if any(re.search(r'\bMain\b', line, re.I) and re.search(r'\bAdvanced\b', line, re.I) for line in evidence):
+        families = {'jee-main', 'jee-advanced'}
     if len(families) != 1:
         return 'unknown', None, None, evidence
     family = families.pop()
@@ -1125,6 +1142,241 @@ def inspect_exam_source(source=None, export=None):
     return result
 
 
+_COMPANION_DASHES = str.maketrans({c: '-' for c in '\u2010\u2011\u2012\u2013\u2014\u2212'})
+_COMPANION_ROLE_PATTERNS = (
+    ('final_key', r'FINAL[-_ ]+KEY', '.pdf'),
+    ('combined', r'KEY[-_ ]*(?:&|AND)[-_ ]*SOLS', '.pdf'),
+    ('answer_key', r'ANSWER[-_ ]+KEY', '.pdf'),
+    ('questions', r'QP', '.pdf'),
+    ('solutions', r'(?:SOLUTIONS|SOLS)', '.pdf'),
+    ('export', r'(?:EXPORT|RESULTS?)', '.zip'),
+    ('answer_key', r'KEY', '.pdf'),
+)
+
+
+def _companion_filename(path):
+    """Parse explicit role suffixes; no substring, fuzzy-ID or source-type guess."""
+    path = Path(path)
+    if path.name.lower() in ('questions.pdf', 'answer_key.pdf', 'solutions.pdf', 'export.zip'):
+        return None  # Existing per-paper role names have no paper-ID prefix.
+    if path.suffix.lower() not in ('.pdf', '.zip'):
+        return None
+    stem = path.stem.translate(_COMPANION_DASHES)
+    for role, pattern, extension in _COMPANION_ROLE_PATTERNS:
+        match = re.fullmatch(r'(.+)_(?:' + pattern + r')', stem, re.I)
+        if match:
+            raw_id = match.group(1)
+            pid = raw_id.strip().upper().replace(' ', '-')
+            error = None
+            try:
+                paper_id(pid)
+            except WorkspaceError:
+                error = 'Invalid paper identifier before the role suffix: ' + raw_id
+            if path.suffix.lower() != extension:
+                error = 'Wrong file format for named ' + role + ' role: ' + path.name
+            return {'paper_id': pid, 'raw_paper_id': raw_id, 'role': role, 'reason': error}
+    return None
+
+
+def has_companion_papers(source):
+    """Detect the explicit QP/key/solutions naming contract without reading PDFs."""
+    source = Path(source).expanduser()
+    if source.is_symlink() or not source.is_dir():
+        return False
+    ignored = {'.git', '.venv', '__pycache__', '__MACOSX'}
+    for current, directories, filenames in os.walk(source, followlinks=False):
+        directories[:] = [name for name in directories if name not in ignored and
+                          not (Path(current) / name).is_symlink()]
+        if any(_companion_filename(name) for name in filenames):
+            return True
+    return False
+
+
+def discover_companion_papers(source, root):
+    """Group explicit same-ID companions in place; never rename or move sources."""
+    source = Path(source).expanduser()
+    if source.is_symlink() or not source.is_dir():
+        raise WorkspaceError('Batch input must be a real folder, not a symlink.')
+    source = source.resolve()
+    root = Path(root).expanduser().resolve()
+    if source == root or source in root.parents or root in source.parents:
+        raise WorkspaceError('Keep batch input and generated job folders separate; neither may contain the other.')
+    entries = []
+    ignored = {'.git', '.venv', '__pycache__', '__MACOSX'}
+    extensions = {'.pdf', '.zip', '.doc', '.docx'}
+
+    def item_for(parent, pid, paths, reason=None):
+        try:
+            inventory = sorted(p.name for p in parent.iterdir() if not p.name.startswith('.'))
+        except OSError:
+            inventory = []
+            reason = reason or 'Could not inspect source folder inventory.'
+        item = {'folder': str(parent), 'paper_id': pid, 'profile': 'unspecified',
+                'files': {}, 'hashes': {}, 'inventory': inventory, 'reason': reason,
+                'discovery_mode': 'explicit_companion_filenames',
+                'source_association': {'method': 'explicit_companion_filenames',
+                    'paper_id': pid, 'filenames': {},
+                    'answer_key_basis': 'embedded_or_export',
+                    'candidates': sorted(path.name for path in paths)}}
+        entries.append(item)
+        return item
+
+    def validate(item):
+        bodies = {}
+        for canonical, name in item['files'].items():
+            path = Path(name)
+            if path.is_symlink() or not path.is_file():
+                raise WorkspaceError('Symlink/special source file refused: ' + path.name)
+            if path.stat().st_size > MAX_FILE:
+                raise WorkspaceError('Input exceeds the 24 MiB per-file limit: ' + path.name)
+            if path not in bodies:
+                validate_export(path) if canonical == 'export.zip' else strict_pdf(path)
+                bodies[path] = sha(path.read_bytes())
+            item['hashes'][canonical] = bodies[path]
+
+    def held(path, reason):
+        return item_for(path.parent, _all_paper_id(path.relative_to(source).as_posix()), [path], reason)
+
+    def walk_error(exc):
+        path = Path(exc.filename) if exc.filename else source
+        if path == source:
+            raise WorkspaceError('Could not read the batch input folder.') from exc
+        held(path, 'Folder could not be inspected; its sources were not skipped silently.')
+
+    for current, directories, filenames in os.walk(source, followlinks=False, onerror=walk_error):
+        parent = Path(current)
+        for name in sorted(list(directories), key=lambda name: (name.casefold(), name)):
+            path = parent / name
+            if name in ignored:
+                directories.remove(name)
+            elif path.is_symlink():
+                directories.remove(name)
+                held(path, 'Symlink folder refused; its contents were not followed.')
+        directories.sort(key=lambda name: (name.casefold(), name))
+        paths = [parent / name for name in sorted(filenames, key=lambda name: (name.casefold(), name))
+                 if Path(name).suffix.lower() in extensions]
+        config = parent / 'paper.json'
+        declared, config_error = {}, None
+        if config.exists() or config.is_symlink():
+            try:
+                if config.is_symlink() or not config.is_file() or config.stat().st_size > 16384:
+                    raise WorkspaceError('Unsafe or oversized paper.json.')
+                declared = json.loads(config.read_text())
+                if not isinstance(declared, dict) or set(declared) - {'paper_id', 'profile', 'files', 'ignore'}:
+                    raise WorkspaceError('Invalid paper.json settings.')
+                if 'ignore' in declared and 'files' not in declared:
+                    raise WorkspaceError('paper.json ignore requires explicit files selections.')
+            except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+                config_error = str(exc)
+                declared = {}
+        groups, unknown = {}, []
+        for path in paths:
+            # An owner's explicit mapping has precedence over role-shaped
+            # arbitrary names such as FINAL_KEY.pdf inside that paper folder.
+            parsed = None if 'files' in declared else _companion_filename(path)
+            if parsed is None:
+                unknown.append(path)
+                continue
+            key = parsed['paper_id']
+            group = groups.setdefault(key, {'paths': [], 'roles': {}, 'errors': []})
+            group['paths'].append(path)
+            group['roles'].setdefault(parsed['role'], []).append(path)
+            if parsed['reason']:
+                group['errors'].append(parsed['reason'])
+        for pid, group in sorted(groups.items()):
+            safe_pid = pid if ID_RE.fullmatch(pid) else _all_paper_id(group['paths'][0].relative_to(source).as_posix())
+            item = item_for(parent, safe_pid, group['paths'])
+            try:
+                if config_error:
+                    raise WorkspaceError(config_error)
+                if declared:
+                    if len(groups) != 1:
+                        raise WorkspaceError('paper.json covers multiple companion groups; explicit per-paper settings are required.')
+                    item['paper_id'] = paper_id(declared.get('paper_id', item['paper_id']))
+                    item['profile'] = batch_profile(declared.get('profile', 'unspecified'))
+                    item['profile_explicit'] = 'profile' in declared
+                    item['source_association']['paper_id'] = item['paper_id']
+                if group['errors']:
+                    raise WorkspaceError('; '.join(group['errors']))
+                roles = group['roles']
+                duplicates = [role for role, matches in roles.items() if len(matches) != 1]
+                if duplicates:
+                    raise WorkspaceError('Duplicate/ambiguous named source role: ' + ', '.join(duplicates))
+                selected = {role: matches[0] for role, matches in roles.items()}
+                if 'questions' not in selected and 'export' not in selected:
+                    raise WorkspaceError('Companion files have no same-ID QP or existing export; no question paper was guessed.')
+                files = {}
+                for role, canonical in (('questions', 'questions.pdf'), ('export', 'export.zip')):
+                    if role in selected:
+                        files[canonical] = selected[role]
+                key_role = next((role for role in ('final_key', 'answer_key', 'combined') if role in selected), None)
+                if key_role:
+                    files['answer_key.pdf'] = selected[key_role]
+                solution = selected.get('solutions') or selected.get('combined')
+                if solution:
+                    files['solutions.pdf'] = solution
+                unused = set(group['paths']) - set(files.values())
+                if unused:
+                    raise WorkspaceError('Additional independent key/solutions sources require explicit selection: ' +
+                                         ', '.join(sorted(path.name for path in unused)))
+                association = item['source_association']
+                association['answer_key_basis'] = {'final_key': 'final_key', 'answer_key': 'answer_key',
+                                                   'combined': 'combined_key_solutions'}.get(key_role, 'embedded_or_export')
+                if 'combined' in selected:
+                    association['combined_key_solutions_filename'] = selected['combined'].name
+                if 'final_key' in selected:
+                    association['final_key_filename'] = selected['final_key'].name
+                association['filenames'] = {canonical: path.name for canonical, path in files.items()}
+                item['files'] = {canonical: str(path) for canonical, path in files.items()}
+                validate(item)
+            except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+                item['reason'] = str(exc)
+
+        canonical = any(path.name.lower() in ('questions.pdf', 'export.zip') for path in unknown)
+        if not groups and (canonical or config.exists() or config.is_symlink()):
+            item = item_for(parent, _all_paper_id(parent.name), unknown)
+            try:
+                settings = {}
+                if config.exists() or config.is_symlink():
+                    if config.is_symlink() or not config.is_file() or config.stat().st_size > 16384:
+                        raise WorkspaceError('Unsafe or oversized paper.json.')
+                    settings = json.loads(config.read_text())
+                    if not isinstance(settings, dict) or set(settings) - {'paper_id', 'profile', 'files', 'ignore'}:
+                        raise WorkspaceError('Invalid paper.json settings.')
+                item['paper_id'] = paper_id(settings.get('paper_id', parent.name.upper().replace(' ', '-').translate(_COMPANION_DASHES)))
+                item['profile'] = batch_profile(settings.get('profile', 'unspecified'))
+                item['profile_explicit'] = 'profile' in settings
+                for path in unknown:
+                    if path.is_symlink() or not path.is_file():
+                        raise WorkspaceError('Symlink/special source file refused: ' + path.name)
+                candidates = {path.name: path for path in unknown if path.suffix.lower() in ('.pdf', '.zip')}
+                names = associate_files(source, root, parent, candidates, settings, select_files=False)
+                item['files'] = {canonical: str(path) for canonical, path in names.items()}
+                item['source_association'] = {'method': 'explicit_grouped_folder',
+                    'paper_id': item['paper_id'], 'filenames': {canonical: path.name for canonical, path in names.items()},
+                    'answer_key_basis': 'answer_key' if 'answer_key.pdf' in names else 'embedded_or_export',
+                    'candidates': sorted(path.name for path in unknown)}
+                item['unprocessed_documents'] = [path.name for path in unknown if path.suffix.lower() in ('.doc', '.docx')]
+                validate(item)
+            except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+                item['reason'] = str(exc)
+            unknown = []
+        for path in unknown:
+            reason = ('Word documents need a PDF copy; original remains unchanged.' if path.suffix.lower() in ('.doc', '.docx') else
+                      'Unrecognised source association; no question/key/solutions role was guessed for ' + path.name)
+            held(path, reason)
+    if not entries:
+        raise WorkspaceError('No paper sources found in the selected folder.')
+    ids = {}
+    for item in entries:
+        ids.setdefault(item['paper_id'], []).append(item)
+    for pid, matches in ids.items():
+        if len(matches) > 1:
+            for item in matches:
+                item['reason'] = 'Duplicate paper ID ' + pid + ' in different source groups; explicit disambiguation required.'
+    return entries
+
+
 PROFILES = ('unspecified', 'jee-main-mock', 'jee-advanced-source')
 
 
@@ -1311,6 +1563,17 @@ def discover_batch(source, root, profile='unspecified', overrides=None, select_f
         raise WorkspaceError('Keep batch input and generated job folders separate; neither may contain the other.')
     batch_profile(profile)
     overrides = overrides or {}
+    if has_companion_papers(source):
+        entries = discover_companion_papers(source, root)
+        for item in entries:
+            if not item.get('profile_explicit'):
+                item['profile'] = profile
+            if item['paper_id'] in overrides:
+                item['profile'] = batch_profile(overrides[item['paper_id']])
+                item['profile_explicit'] = True
+        if set(overrides) - {item['paper_id'] for item in entries}:
+            raise WorkspaceError('Profile override references an unknown paper ID.')
+        return entries
     entries = []
     for directory in sorted(source.iterdir(), key=lambda p: p.name.casefold()):
         if directory.name.startswith('.'):
@@ -1417,7 +1680,10 @@ def apply_batch_exam_policy(entries, policy=None):
 
 
 def _batch_entries(args, overrides):
-    if getattr(args, 'all_papers', False):
+    if has_companion_papers(args.source):
+        entries = discover_batch(args.source, args.root, args.profile, overrides,
+                                 select_files=getattr(args, 'select_files', False))
+    elif getattr(args, 'all_papers', False):
         entries = discover_all_papers(args.source, args.root)
         for item in entries:
             item['profile'] = args.profile
@@ -1467,7 +1733,8 @@ def run_batch(args, entries=None):
                 source_pdf=Path(files['questions.pdf']) if 'export.zip' in files and 'questions.pdf' in files else None,
                 key=files.get('answer_key.pdf'), solutions=files.get('solutions.pdf'),
                 root=args.root, paper_id=pid, profile=item['profile'], offline=True,
-                keep_color=args.keep_color, no_review=True, exam_intent=item.get('exam_intent'))
+                keep_color=args.keep_color, no_review=True, exam_intent=item.get('exam_intent'),
+                source_association=item.get('source_association'))
             previous = json.loads((folder / 'status.json').read_text()) if (folder / 'status.json').is_file() else {}
             if 'export.zip' in files:
                 attach(run_args)
@@ -1529,7 +1796,10 @@ def interactive_batch(path):
     loose = any(p.suffix.lower() in ('.pdf', '.zip', '.doc', '.docx') for p in path.iterdir() if p.is_file())
     nested = any(p.is_dir() and not p.is_symlink() and not p.name.startswith('.') and
                  any(child.is_dir() and not child.name.startswith('.') for child in p.iterdir()) for p in path.iterdir())
-    if loose or nested:
+    companions = has_companion_papers(path)
+    if companions:
+        print('Matched paper IDs in QP / FINAL-KEY / KEY-&-SOLS filenames. No moving or renaming is needed.')
+    elif loose or nested:
         print('This folder has loose files or nested folders. File associations will not be guessed.')
         choice = input('a = every PDF/ZIP is a complete paper (scan all subfolders); Enter = use one grouped subfolder per paper > ').strip().lower()
         all_papers = choice == 'a'

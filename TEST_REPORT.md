@@ -1,3 +1,13 @@
+# Flat same-ID companions — 13 November 2026
+
+Current result: **229 tests passed** using `python -m unittest discover -s tests -v` in Linux (189prior +24 companion grouping +9 pipeline +7 unchanged-key/heading tests). Python compilation, both shell syntax checks and `git diff --check` passed. Tested client blob: `2effda9b5870f374bef3ff4dcb0352f5ec2cbc57`. Cropper SHA is unchanged: `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+A real owner screenshot showed every loose QP/key/solutions file held for lack of per-paper folders. Synthetic regressions now group exact IDs, prefer Final keys, use combined fallback for both roles, preserve source bytes and existing configured/canonical folders, reject ambiguity/duplicates/orphans/unsafe inputs, and recognise case/Unicode dash spelling. Pipeline tests process each QP once with the correct chosen key, save supplied solutions as unmatched, preserve numerical zero and existing ZIP exports, reuse immutable legacy manifest bytes/crops, and retry simulated uploads without new crops/commits. Identical combined content is sent as one Git blob for its two canonical references.
+
+Three tests execute the real unchanged key_from_file with mocked page rendering/text:15keys with zero preserved, solution-only page skipped, per-page ten-key threshold and later-grid overwrite behaviour. Four cover Main/Advanced paired-parenthesis titles and ambiguity. A further pipeline test keeps ambiguous PDF intent unresolved despite Main export metadata. None of these is real PDF OCR, actual Mac operation, independent answer verification or Advanced grading completeness evidence. Test dependencies now include the cropper's existing NumPy import.
+
+No source paper was fetched/processed in this cloud workspace, no cropper/cleaning algorithm was modified, and no app, bank, workflow, billing plan or live-site deployment was changed. Earlier Advanced source/type/completeness holds remain necessary.
+
 # Mixed paper inventory, source evidence and interface intent — 13 November 2026
 
 Current result: **189 tests passed** with `python -m unittest discover -s tests -v` on Linux:145 prior,15 complete-file inventory,18 source evidence,11 mixed-policy integration. Python compilation, both shell syntax checks and `git diff --check` passed. Client Git blob: `01e8a8c5151af1e43a6329cffaa318eeed6f4b0f`. Cropper SHA remains unchanged `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
