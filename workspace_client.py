@@ -12,6 +12,7 @@ are made here; source answers and crop completeness are not independently verifi
 from __future__ import annotations
 import argparse
 import base64
+from contextlib import contextmanager, ExitStack
 import datetime as dt
 import hashlib
 import io
@@ -25,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 import zipfile
 
@@ -57,16 +59,55 @@ def encoded(obj):
 
 
 def save_json(path, obj):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_bytes(encoded(obj))
-    tmp.replace(path)
+    # A unique, exclusively created file cannot follow a stale *.tmp symlink.
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '.',
+                                         suffix='.tmp', delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(encoded(obj))
+            stream.flush()
+            os.fsync(stream.fileno())
+        tmp.replace(path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def paper_id(value):
-    if not ID_RE.fullmatch(value):
+    if not isinstance(value, str) or not ID_RE.fullmatch(value):
         raise WorkspaceError('Paper ID: use 1-80 uppercase letters, digits, - or _.')
     return value
+
+
+@contextmanager
+def job_lock(root, pid):
+    """One lock for preparing, cropping, attaching and syncing a local paper."""
+    import fcntl
+    pid = paper_id(pid)
+    root = Path(root).expanduser().resolve()
+    lock_dir = root / '.locks'
+    if lock_dir.is_symlink() or (root / pid).is_symlink():
+        raise WorkspaceError('Symlink job/lock directory refused.')
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    path = lock_dir / (pid + '.lock')
+    paths = [path]
+    # Older installed clients lock inside an existing job directory. Keep that
+    # protection while moving preparation under the shared root lock.
+    if (root / pid).is_dir():
+        paths.append(root / pid / '.run.lock')
+    with ExitStack() as opened:
+        for path in paths:
+            if path.is_symlink():
+                raise WorkspaceError('Symlink lock refused.')
+            lock = opened.enter_context(path.open('a'))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise WorkspaceError('This paper is already running or syncing on this Mac.') from exc
+        yield  # Closing the file descriptors releases both locks, even on error.
 
 
 def safe_member(name):
@@ -81,15 +122,15 @@ def path_from_prompt(text):
     if not text:
         return None
     # Handle Finder's escaped spaces, single quotes and double quotes; no eval.
-    if Path(text).expanduser().is_file():
-        return Path(text).expanduser().resolve()
+    if Path(text).expanduser().exists():
+        return Path(text).expanduser().absolute()
     try:
         parts = shlex.split(text)
     except ValueError as exc:
         raise WorkspaceError('Could not read the dragged path.') from exc
     if len(parts) != 1:
-        raise WorkspaceError('Drag ONE file into each prompt, not several.')
-    return Path(parts[0]).expanduser().resolve()
+        raise WorkspaceError('Drag ONE file or batch folder into each prompt, not several paths.')
+    return Path(parts[0]).expanduser().absolute()
 
 
 def input_pdf(path):
@@ -246,22 +287,70 @@ class GitHub:
 
 
 def sync_job(folder, api=None):
+    folder = Path(folder).expanduser()
+    if folder.is_symlink():
+        raise WorkspaceError('Symlink job folder refused.')
+    folder = folder.resolve()
+    with job_lock(folder.parent, folder.name):
+        return _sync_job(folder, api)
+
+
+def _sync_job(folder, api=None):
     folder = Path(folder).expanduser().resolve()
-    job = json.loads((folder / 'job.json').read_text())
-    pid = paper_id(job['paper_id'])
+    manifest_path = folder / 'job.json'
     status_path = folder / 'status.json'
-    status = json.loads(status_path.read_text())
-    allowed = [folder / 'job.json', status_path]
-    allowed += list((folder / 'input').glob('*.pdf'))
+    if manifest_path.is_symlink() or status_path.is_symlink():
+        raise WorkspaceError('Symlink manifest/status refused.')
+    manifest_body, status_body = manifest_path.read_bytes(), status_path.read_bytes()
+    job = json.loads(manifest_body)
+    status = json.loads(status_body)
+    validated = {manifest_path: manifest_body, status_path: status_body}
+    if not isinstance(job, dict) or not isinstance(status, dict):
+        raise WorkspaceError('Malformed job/status: expected objects.')
+    pid = paper_id(job.get('paper_id'))
+    if pid != folder.name or status.get('paper_id') != pid:
+        raise WorkspaceError('Job/status paper ID does not match its local folder.')
+    if status.get('state') not in ('processing', 'held', 'ready_for_integration'):
+        raise WorkspaceError('Invalid Mac processing state.')
+    inputs = job.get('inputs')
+    if not isinstance(inputs, dict) or set(inputs) - {'questions', 'answer_key', 'solutions'}:
+        raise WorkspaceError('Invalid source input manifest.')
+    allowed = [manifest_path, status_path]
+    for role, item in inputs.items():
+        name = 'input/' + role + '.pdf'
+        if not isinstance(item, dict) or item.get('file') != name or type(item.get('size')) is not int or not isinstance(item.get('sha256'), str):
+            raise WorkspaceError('Malformed original input record: ' + role)
+        path = folder / name
+        if (folder / 'input').is_symlink() or path.is_symlink() or folder not in path.resolve().parents or not path.is_file():
+            raise WorkspaceError('Original input missing or unsafe: ' + role)
+        if not 0 <= path.stat().st_size <= MAX_FILE:
+            raise WorkspaceError('Original input exceeds the 24 MiB limit: ' + role)
+        body = path.read_bytes()
+        if len(body) != item['size'] or sha(body) != item['sha256']:
+            raise WorkspaceError('Original input changed; restore the immutable source before syncing: ' + role)
+        validated[path] = body
+        allowed.append(path)
+    if status.get('state') == 'ready_for_integration':
+        cached_run(folder)  # Refuse missing or changed completed artifacts.
+        run_record = json.loads((folder / 'runs' / status['run_id'] / 'run.json').read_text())
+        if run_record.get('input_manifest_sha256') != sha(manifest_body):
+            raise WorkspaceError('Completed run does not match its immutable input manifest; restore it before syncing.')
     if status.get('run_id'):
-        run = folder / 'runs' / status['run_id']
+        rid = status['run_id']
+        if not isinstance(rid, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,119}', rid):
+            raise WorkspaceError('Invalid saved run ID.')
+        if (folder / 'runs').is_symlink():
+            raise WorkspaceError('Symlink runs directory refused.')
+        run = folder / 'runs' / rid
+        if run.is_symlink():
+            raise WorkspaceError('Symlink run directory refused.')
         names = ('export.zip', 'exam.json', 'checks.json', 'run.json') if status['state'] == 'ready_for_integration' else ('REFUSED.txt',)
         allowed += [run / n for n in names if (run / n).is_file()]
     files = {}
     for p in allowed:
         if p.is_symlink() or folder not in p.resolve().parents:
             raise WorkspaceError('Symlink/outside path refused.')
-        files[f'paper_jobs/{pid}/' + p.relative_to(folder).as_posix()] = p.read_bytes()
+        files[f'paper_jobs/{pid}/' + p.relative_to(folder).as_posix()] = validated[p] if p in validated else p.read_bytes()
     result = (api or GitHub()).upload(files, 'Sync paper ' + pid + ': ' + status['state'])
     # Receipt is local only: no ever-changing timestamps to cause repeated commits.
     save_json(folder / 'sync_receipt.json', dict(result, synced_at=now(), branch=BRANCH))
@@ -270,10 +359,13 @@ def sync_job(folder, api=None):
     return result
 
 
-def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspecified'):
+def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspecified',
+                export=None, keep_color=False):
     pid = paper_id(pid)
     root = Path(root).expanduser().resolve()
     folder = root / pid
+    if folder.is_symlink():
+        raise WorkspaceError('Symlink job folder refused.')
     folder.mkdir(parents=True, exist_ok=True)
     roles = {'questions': source, 'answer_key': key, 'solutions': solutions}
     inputs = {}
@@ -284,15 +376,33 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
                             'sha256': sha(p.read_bytes()), 'size': p.stat().st_size}
     job = {'schema': 'modulus_shared_paper_v1', 'paper_id': pid, 'inputs': inputs,
            'profile': profile, 'profile_basis': 'owner_selected' if profile != 'unspecified' else 'not_selected'}
+    if export:
+        p = Path(export)
+        job['source_export'] = {'original_name': p.name, 'sha256': sha(p.read_bytes()),
+                                'size': p.stat().st_size}
+    if keep_color:
+        job['crop_settings'] = {'keep_color': True}
     if profile == 'jee-main-mock':
         job['requested_scoring'] = {'correct': 4, 'incorrect': -1, 'unanswered': 0,
                                     'duration_minutes': 180, 'basis': 'owner_selected_mock_rules'}
     path = folder / 'job.json'
-    if path.exists() and json.loads(path.read_text()) != job:
-        raise WorkspaceError('This paper ID already has different files or settings. Choose a new ID; previous work is preserved.')
+    if path.is_symlink() or (folder / 'input').is_symlink():
+        raise WorkspaceError('Symlink manifest/input directory refused.')
+    if path.exists():
+        old = json.loads(path.read_text())
+        # Legacy attach manifests did not contain the export identity. Reuse an
+        # exact completed export without rewriting that immutable manifest.
+        legacy = dict(job)
+        legacy.pop('source_export', None)
+        if export and 'source_export' not in old and old == legacy and cached_run(folder, job['source_export']['sha256']):
+            job = old
+        if old != job:
+            raise WorkspaceError('This paper ID already has different files or settings. Choose a new ID; previous work is preserved.')
     for role, value in roles.items():
         if value:
             dest = folder / inputs[role]['file']
+            if dest.is_symlink():
+                raise WorkspaceError('Symlink input refused.')
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists() and sha(dest.read_bytes()) != inputs[role]['sha256']:
                 raise WorkspaceError('Input collision; original retained.')
@@ -328,10 +438,23 @@ def cached_run(folder, export_sha=None):
     if not status.is_file():
         return False
     state = json.loads(status.read_text())
-    run = folder / 'runs' / state.get('run_id', 'none') / 'run.json'
-    if state.get('state') != 'ready_for_integration' or not run.is_file():
+    if state.get('state') != 'ready_for_integration':
         return False
+    rid = state.get('run_id')
+    if not isinstance(rid, str) or not rid or PurePosixPath(rid).name != rid or rid in ('.', '..') or '\\' in rid:
+        raise WorkspaceError('Invalid saved run ID.')
+    run = folder / 'runs' / rid / 'run.json'
+    required = ('run.json', 'exam.json', 'checks.json', 'export.zip')
+    for name in required:
+        path = run.parent / name
+        if path.is_symlink() or folder not in path.resolve().parents or not path.is_file():
+            raise WorkspaceError('Completed run is missing/unsafe; original run retained. Restore it before retrying.')
     previous = json.loads(run.read_text())
+    if sha((run.parent / 'export.zip').read_bytes()) != previous.get('export_sha256'):
+        raise WorkspaceError('Completed export changed; original run retained. Restore it before retrying.')
+    data, checks = validate_export(run.parent / 'export.zip')
+    if json.loads((run.parent / 'exam.json').read_text()) != data or json.loads((run.parent / 'checks.json').read_text()).get('export_sha256') != checks['export_sha256']:
+        raise WorkspaceError('Completed run metadata changed; restore it before retrying.')
     if export_sha:
         return previous.get('export_sha256') == export_sha
     return previous.get('input_manifest_sha256') == sha((folder / 'job.json').read_bytes()) and previous.get('cropper_sha256') == sha((HERE / 'question_boundaries.py').read_bytes())
@@ -339,6 +462,8 @@ def cached_run(folder, export_sha=None):
 
 def new_run(folder):
     rid = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
+    if (folder / 'runs').is_symlink():
+        raise WorkspaceError('Symlink runs directory refused.')
     run = folder / 'runs' / rid
     run.mkdir(parents=True)
     return run
@@ -354,84 +479,314 @@ def package_output(output, destination):
 
 
 def process(args):
-    # Validate all provided files before making a job or running the cropper.
+    with job_lock(args.root, args.paper_id):
+        return _process(args)
+
+
+def _process(args):
+    # The lock covers immutable input preparation as well as cropper execution.
     source = input_pdf(args.source)
-    for p in (args.key, args.solutions):
+    key, solutions = getattr(args, 'key', None), getattr(args, 'solutions', None)
+    keep_color = getattr(args, 'keep_color', False)
+    for p in (key, solutions):
         if p:
             input_pdf(p)
-    folder, job = prepare_job(args.root, args.paper_id, source, args.key, args.solutions, args.profile)
-    # One process per local paper. Process crash releases this lock automatically.
-    import fcntl
-    with (folder / '.run.lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise WorkspaceError('This paper is already running on this Mac.') from exc
-        if cached_run(folder):
-            print('Already processed with this cropper; reusing existing crops.')
-            if not args.offline:
-                sync_job(folder)
-            return folder
-        run = new_run(folder)
-        record_status(folder, job, 'processing', run.name)
+    folder, job = prepare_job(args.root, args.paper_id, source, key, solutions,
+                              args.profile, keep_color=keep_color)
+    if cached_run(folder):
+        print('Already processed with this cropper; reusing existing crops.')
         if not args.offline:
-            sync_job(folder)
-        output = run / 'local_crop_output'
-        command = [sys.executable, str(HERE / 'question_boundaries.py'),
-                   str(folder / 'input/questions.pdf'), '--out', str(output)]
-        if args.key:
-            command += ['--key', str(folder / 'input/answer_key.pdf')]
-        if args.keep_color:
-            command += ['--keep-color']
-        try:
-            result = subprocess.run(command, check=False)
-            if result.returncode:
-                reason = (output / 'REFUSED.txt').read_text() if (output / 'REFUSED.txt').is_file() else 'Cropper exited with code ' + str(result.returncode)
-                raise WorkspaceError(reason)
-            package_output(output, run / 'export.zip')
-            finish_run(folder, job, run, run / 'export.zip')
-        except Exception as exc:
-            (run / 'REFUSED.txt').write_text(str(exc)[:20000])
-            record_status(folder, job, 'held', run.name, reason=str(exc)[:2000])
-            if not args.offline:
-                sync_job(folder)
-            raise WorkspaceError('Paper not accepted. Originals and report kept in ' + str(folder)) from exc
-        if not args.offline:
-            sync_job(folder)
-        print('Local results: ' + str(output))
-        if sys.platform == 'darwin' and (output / 'review.html').is_file():
-            subprocess.run(['open', str(output / 'review.html')], check=False)
+            _sync_job(folder)
         return folder
+    run = new_run(folder)
+    record_status(folder, job, 'processing', run.name)
+    # Local work must continue even when GitHub is unavailable. Sync once the
+    # result or refusal exists, so upload retry never requires recropping.
+    output = run / 'local_crop_output'
+    command = [sys.executable, str(HERE / 'question_boundaries.py'),
+               str(folder / 'input/questions.pdf'), '--out', str(output)]
+    if key:
+        command += ['--key', str(folder / 'input/answer_key.pdf')]
+    if keep_color:
+        command += ['--keep-color']
+    try:
+        result = subprocess.run(command, check=False)
+        if result.returncode:
+            reason = (output / 'REFUSED.txt').read_text() if (output / 'REFUSED.txt').is_file() else 'Cropper exited with code ' + str(result.returncode)
+            raise WorkspaceError(reason)
+        package_output(output, run / 'export.zip')
+        finish_run(folder, job, run, run / 'export.zip')
+    except Exception as exc:
+        (run / 'REFUSED.txt').write_text(str(exc)[:20000])
+        record_status(folder, job, 'held', run.name, reason=str(exc)[:2000])
+        upload_error = ''
+        if not args.offline:
+            try:
+                _sync_job(folder)
+            except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as sync_exc:
+                upload_error = ' Upload also failed: ' + str(sync_exc)
+        raise WorkspaceError('Paper held: ' + str(exc)[:2000] + '. Originals/report kept in ' + str(folder) + upload_error) from exc
+    if not args.offline:
+        _sync_job(folder)
+    print('Local results: ' + str(output))
+    if not getattr(args, 'no_review', False) and sys.platform == 'darwin' and (output / 'review.html').is_file():
+        subprocess.run(['open', str(output / 'review.html')], check=False)
+    return folder
 
 
 def attach(args):
+    with job_lock(args.root, args.paper_id):
+        return _attach(args)
+
+
+def _attach(args):
     # Existing accepted export: upload unchanged, do NOT recrop.
     validate_export(args.source)
-    folder, job = prepare_job(args.root, args.paper_id, profile=args.profile)
+    folder, job = prepare_job(args.root, args.paper_id,
+        source=getattr(args, 'source_pdf', None), key=getattr(args, 'key', None),
+        solutions=getattr(args, 'solutions', None), profile=args.profile,
+        export=args.source)
     if cached_run(folder, sha(Path(args.source).read_bytes())):
         if not args.offline:
-            sync_job(folder)
+            _sync_job(folder)
         print('This export is already stored; no duplicate run created.')
         return folder
     run = new_run(folder)
     shutil.copy2(args.source, run / 'export.zip')
     finish_run(folder, job, run, run / 'export.zip')
     if not args.offline:
-        sync_job(folder)
+        _sync_job(folder)
     print('Existing crops preserved. Local copy: ' + str(folder))
     return folder
+
+
+PROFILES = ('unspecified', 'jee-main-mock')
+
+
+def strict_pdf(path):
+    """Batch preflight: parse every PDF before any cropper starts."""
+    path = input_pdf(path)
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as doc:
+            if not doc.pages:
+                raise ValueError('no pages')
+            for page in doc.pages:
+                if page.width <= 0 or page.height <= 0:
+                    raise ValueError('invalid page size')
+                # Resolve content streams too, without OCR or rendering.
+                for stream in page.page_obj.contents:
+                    stream.get_data()
+                page.objects
+    except ImportError as exc:
+        raise WorkspaceError('PDF validation needs pdfplumber. Run the Mac launcher to install it.') from exc
+    except Exception as exc:
+        raise WorkspaceError('Unreadable/corrupt or password-protected PDF: ' + path.name) from exc
+    return path
+
+
+def batch_profile(value):
+    if value not in PROFILES:
+        raise WorkspaceError('Profile must be unspecified or jee-main-mock (explicit owner selection).')
+    return value
+
+
+def discover_batch(source, root, profile='unspecified', overrides=None):
+    """Read-only discovery. No guessed associations, output directories or cropping."""
+    source = Path(source).expanduser()
+    if source.is_symlink() or not source.is_dir():
+        raise WorkspaceError('Batch input must be a real folder, not a symlink.')
+    source = source.resolve()
+    root = Path(root).expanduser().resolve()
+    if source == root or source in root.parents or root in source.parents:
+        raise WorkspaceError('Keep batch input and generated job folders separate; neither may contain the other.')
+    batch_profile(profile)
+    overrides = overrides or {}
+    entries = []
+    for directory in sorted(source.iterdir(), key=lambda p: p.name.casefold()):
+        if directory.name.startswith('.'):
+            continue  # Finder metadata, never an input paper.
+        item = {'folder': str(directory), 'paper_id': directory.name.upper().replace(' ', '-'),
+                'profile': profile, 'files': {}, 'hashes': {}, 'reason': None}
+        entries.append(item)
+        try:
+            if directory.is_symlink() or not directory.is_dir():
+                raise WorkspaceError('Expected one real subfolder per paper; loose files/symlinks are not processed.')
+            config = directory / 'paper.json'
+            if config.exists() or config.is_symlink():
+                if config.is_symlink() or not config.is_file() or config.stat().st_size > 16384:
+                    raise WorkspaceError('Unsafe or oversized paper.json.')
+                settings = json.loads(config.read_text())
+                if not isinstance(settings, dict) or set(settings) - {'paper_id', 'profile'}:
+                    raise WorkspaceError('paper.json accepts only paper_id and profile.')
+                item['paper_id'] = paper_id(settings.get('paper_id', item['paper_id']))
+                item['profile'] = batch_profile(settings.get('profile', profile))
+            paper_id(item['paper_id'])
+            item['inventory'] = sorted(p.name for p in directory.iterdir() if not p.name.startswith('.'))
+            names = {}
+            for p in directory.iterdir():
+                if p.name.startswith('.') or p.name == 'paper.json':
+                    continue
+                if p.is_symlink() or p.is_dir():
+                    raise WorkspaceError('Symlinks/nested input folders are not accepted: ' + p.name)
+                name = p.name.lower()
+                if p.suffix.lower() in ('.pdf', '.zip'):
+                    if name not in ('questions.pdf', 'answer_key.pdf', 'solutions.pdf', 'export.zip'):
+                        raise WorkspaceError('Ambiguous input ' + p.name + '; use questions.pdf, answer_key.pdf, solutions.pdf or export.zip.')
+                    if name in names:
+                        raise WorkspaceError('Duplicate input role: ' + name)
+                    names[name] = p
+            if 'questions.pdf' not in names and 'export.zip' not in names:
+                raise WorkspaceError('Missing questions.pdf or export.zip.')
+            for name, p in names.items():
+                if name == 'export.zip':
+                    validate_export(p)
+                else:
+                    strict_pdf(p)
+                item['files'][name] = str(p)
+                item['hashes'][name] = sha(p.read_bytes())
+            if item['paper_id'] in overrides:
+                item['profile'] = batch_profile(overrides[item['paper_id']])
+        except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+            item['reason'] = str(exc)
+    if not entries:
+        raise WorkspaceError('No paper subfolders found in the batch input folder.')
+    ids = {}
+    for item in entries:
+        ids.setdefault(item['paper_id'], []).append(item)
+    for pid, duplicates in ids.items():
+        if len(duplicates) > 1:
+            for item in duplicates:
+                item['reason'] = 'Duplicate paper ID ' + pid + '; all folders with this ID are held.'
+    if set(overrides) - set(ids):
+        raise WorkspaceError('Profile override references an unknown paper ID: ' + ', '.join(sorted(set(overrides) - set(ids))))
+    return entries
+
+
+def show_batch(entries):
+    print('\nBATCH PREFLIGHT — ' + str(len(entries)) + ' paper folders (processed sequentially)')
+    for item in entries:
+        if item['reason']:
+            print('  ' + item['paper_id'] + ' | HELD: ' + item['reason'])
+        else:
+            files = item['files']
+            mode = 'reuse export unchanged' if 'export.zip' in files else 'crop questions.pdf'
+            key = 'separate key' if 'answer_key.pdf' in files else 'key from existing export' if 'export.zip' in files else 'embedded key (if present)'
+            solutions = 'solutions stored, not matched' if 'solutions.pdf' in files else 'no solutions supplied'
+            print('  ' + item['paper_id'] + ' | ' + mode + ' | ' + key + ' | ' + solutions + ' | profile=' + item['profile'])
+
+
+def run_batch(args, entries=None):
+    overrides = {}
+    for value in getattr(args, 'paper_profile', []) or []:
+        pid, sep, profile = value.partition('=')
+        if not sep or paper_id(pid) in overrides:
+            raise WorkspaceError('Use each --paper-profile ID=PROFILE once.')
+        overrides[pid] = batch_profile(profile)
+    if entries is None:
+        entries = discover_batch(args.source, args.root, args.profile, overrides)
+        show_batch(entries)
+    report_dir = Path(args.root).expanduser().resolve() / '.batch_reports'
+    if report_dir.is_symlink() or (report_dir.exists() and not report_dir.is_dir()):
+        raise WorkspaceError('Unsafe batch report directory; no papers processed.')
+    results = []
+    for item in entries:
+        pid = item['paper_id']
+        row = {'paper_id': pid, 'input_folder': item['folder'], 'outcome': 'held', 'reason': item['reason']}
+        results.append(row)
+        if item['reason']:
+            continue
+        folder = Path(args.root).expanduser().resolve() / pid
+        files = item['files']
+        # Check the snapshot again; do not process a changed folder after preflight.
+        try:
+            directory = Path(item['folder'])
+            if directory.is_symlink() or sorted(p.name for p in directory.iterdir() if not p.name.startswith('.')) != item['inventory']:
+                raise WorkspaceError('Input folder changed after preflight. Rerun the batch.')
+            for name, path in files.items():
+                p = Path(path)
+                if p.is_symlink() or not p.is_file() or sha(p.read_bytes()) != item['hashes'][name]:
+                    raise WorkspaceError('Input changed after preflight: ' + name + '. Rerun the batch.')
+            run_args = argparse.Namespace(source=Path(files.get('export.zip', files.get('questions.pdf'))),
+                source_pdf=Path(files['questions.pdf']) if 'export.zip' in files and 'questions.pdf' in files else None,
+                key=files.get('answer_key.pdf'), solutions=files.get('solutions.pdf'),
+                root=args.root, paper_id=pid, profile=item['profile'], offline=True,
+                keep_color=args.keep_color, no_review=True)
+            previous = json.loads((folder / 'status.json').read_text()) if (folder / 'status.json').is_file() else {}
+            if 'export.zip' in files:
+                attach(run_args)
+            else:
+                process(run_args)
+            current = json.loads((folder / 'status.json').read_text())
+            reused = previous.get('run_id') == current.get('run_id')
+            row['run_id'] = current['run_id']
+            if args.offline:
+                row.update(outcome='already processed' if reused else 'upload failed/local-only',
+                           reason='Local results retained; offline mode selected.')
+            else:
+                try:
+                    receipt = sync_job(folder)
+                    row.update(outcome='already processed' if reused and receipt['changed'] == 0 else 'synced',
+                               reason=None, commit=receipt['commit'])
+                except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                    row.update(outcome='upload failed/local-only', reason=str(exc) + ' Rerun this batch to retry; crops are saved.')
+        except Exception as exc:
+            row['reason'] = str(exc)
+            # A refusal is useful to collaborators, but never hide it behind an upload error.
+            try:
+                state = json.loads((folder / 'status.json').read_text())
+                if state.get('state') == 'held' and not args.offline:
+                    sync_job(folder)
+            except Exception as upload_exc:
+                row['upload_note'] = str(upload_exc)
+        print('BATCH: ' + pid + ' | ' + row['outcome'] + (' | ' + row['reason'] if row['reason'] else ''))
+    if report_dir.is_symlink():
+        raise WorkspaceError('Batch results kept, but report directory became a symlink; report write refused.')
+    report = report_dir / (dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8] + '.json')
+    save_json(report, {'schema': 'modulus_batch_report_v1', 'completed_at': now(),
+        'input_folder': str(Path(args.source).expanduser().resolve()), 'publication': 'not_deployed', 'papers': results})
+    print('\nBATCH COMPLETE — private workspace handoff, not a deployed examination')
+    for row in results:
+        print('  ' + row['paper_id'] + ': ' + row['outcome'] + (' — ' + row['reason'] if row['reason'] else ''))
+    print('Batch report: ' + str(report))
+    return results
+
+
+def interactive_batch(path):
+    root = Path.home() / 'Modulus Papers'
+    # Discover associations before requesting shared settings; paper.json overrides remain explicit.
+    entries = discover_batch(path, root)
+    show_batch(entries)
+    choice = input('\nMarking: y = JEE Main MOCK (+4/-1/0, 180 min); m = mixed; Enter = unspecified\n(per-paper paper.json profiles take precedence) > ').strip().lower()
+    profile = 'jee-main-mock' if choice == 'y' else 'unspecified'
+    overrides = {}
+    if choice == 'm':
+        for item in entries:
+            if not item['reason']:
+                answer = input(item['paper_id'] + ': y = JEE mock, n = unspecified, Enter = keep ' + item['profile'] + ' > ').strip().lower()
+                if answer in ('y', 'n'):
+                    overrides[item['paper_id']] = 'jee-main-mock' if answer == 'y' else 'unspecified'
+    # No files have been processed yet. Refresh the plan with selected settings.
+    entries = discover_batch(path, root, profile, overrides)
+    print('Selected marking: ' + ', '.join(item['paper_id'] + '=' + item['profile'] for item in entries if not item['reason']))
+    args = argparse.Namespace(source=path, root=root, profile=profile, offline=False,
+                              keep_color=False, paper_profile=[])
+    return run_batch(args, entries)
 
 
 def interactive():
     print('\nMODULUS — one paper workspace, shared by Claude and ChatGPT')
     print('Your PDFs/results go ONLY to the private repository. No Netlify deployment.')
-    print('Drag a question PDF OR an existing result ZIP. Type q to finish.')
+    print('Drag a BATCH FOLDER, a question PDF OR an existing result ZIP. Type q to finish.')
     while True:
-        raw = input('\nQuestion PDF / result ZIP > ').strip()
+        raw = input('\nBatch folder / question PDF / result ZIP > ').strip()
         if raw.lower() == 'q':
             return
         try:
             path = path_from_prompt(raw)
+            if path is not None and path.is_dir():
+                interactive_batch(path)
+                continue
             if path is None or not path.is_file():
                 raise WorkspaceError('File not found.')
             default = re.sub(r'[^A-Z0-9_-]+', '-', path.stem.upper()).strip('-')[:70] or 'PAPER'
@@ -469,6 +824,13 @@ def main():
             sub.add_argument('--key', type=Path)
             sub.add_argument('--solutions', type=Path)
             sub.add_argument('--keep-color', action='store_true')
+    sub = subs.add_parser('batch', help='Process one input subfolder per paper, sequentially.')
+    sub.add_argument('source', type=Path)
+    sub.add_argument('--root', type=Path, default=Path.home() / 'Modulus Papers')
+    sub.add_argument('--profile', choices=PROFILES, default='unspecified')
+    sub.add_argument('--paper-profile', action='append', default=[], metavar='ID=PROFILE')
+    sub.add_argument('--offline', action='store_true')
+    sub.add_argument('--keep-color', action='store_true')
     sub = subs.add_parser('sync')
     sub.add_argument('folder', type=Path)
     args = p.parse_args()
@@ -479,6 +841,9 @@ def main():
             process(args)
         elif args.action == 'attach':
             attach(args)
+        elif args.action == 'batch':
+            results = run_batch(args)
+            return int(any(r['outcome'] in ('held', 'upload failed/local-only') for r in results))
         elif args.action == 'sync':
             sync_job(args.folder)
         else:
