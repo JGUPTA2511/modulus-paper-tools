@@ -407,7 +407,9 @@ def _sync_job(folder, api=None, queue_on_error=True):
         run = folder / 'runs' / rid
         if run.is_symlink():
             raise WorkspaceError('Symlink run directory refused.')
+        run_processing_job(folder, status, manifest_body)
         names = ('export.zip', 'exam.json', 'checks.json', 'run.json') if status['state'] == 'ready_for_integration' else ('REFUSED.txt',)
+        names += ('processing.json',)
         allowed += [run / n for n in names if (run / n).is_file()]
     files = {}
     for p in allowed:
@@ -429,6 +431,85 @@ def _sync_job(folder, api=None, queue_on_error=True):
     print('SYNCED: ' + pid + ' | commit ' + result['commit'][:10])
     print('Both assistants can read: ' + REPO + ' / ' + BRANCH + ' / paper_jobs/' + pid)
     return result
+
+
+def source_identity(job):
+    """Original byte identity; incoming Finder names are descriptive labels."""
+    inputs = job.get('inputs', {})
+    if not isinstance(inputs, dict):
+        raise WorkspaceError('Malformed saved input manifest.')
+    result = {'schema': job.get('schema'), 'paper_id': job.get('paper_id'), 'inputs': {}}
+    for role, record in inputs.items():
+        if role not in ('questions', 'answer_key', 'solutions') or not isinstance(record, dict):
+            raise WorkspaceError('Malformed saved input role.')
+        result['inputs'][role] = {key: record.get(key) for key in ('file', 'sha256', 'size')}
+    if 'source_export' in job:
+        result['source_export'] = {key: job['source_export'].get(key) for key in ('sha256', 'size')}
+    return result
+
+
+def processing_identity(job):
+    result = dict(job)
+    for field in ('exam_intent', 'source_association'):
+        result.pop(field, None)
+    result['inputs'] = source_identity(job)['inputs']
+    if 'source_export' in result:
+        result['source_export'] = source_identity(job)['source_export']
+    return result
+
+
+def verify_saved_inputs(folder, job):
+    """Verify the immutable local originals before permitting any retry."""
+    for role, record in job.get('inputs', {}).items():
+        name = 'input/' + role + '.pdf'
+        path = folder / name
+        if (not isinstance(record, dict) or record.get('file') != name or
+                (folder / 'input').is_symlink() or path.is_symlink() or not path.is_file() or
+                folder not in path.resolve().parents):
+            raise WorkspaceError('Saved original is missing or unsafe: ' + role)
+        if not 0 <= path.stat().st_size <= MAX_FILE or path.stat().st_size != record.get('size') or sha(path.read_bytes()) != record.get('sha256'):
+            raise WorkspaceError('Saved original changed: ' + role + '. Restore that original; previous runs were kept.')
+
+
+def run_processing_job(folder, status, manifest_body, run_record=None):
+    """Read an immutable retry settings snapshot bound to its original manifest."""
+    original = json.loads(manifest_body)
+    rid = status.get('run_id')
+    if not isinstance(rid, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,119}', rid):
+        raise WorkspaceError('Invalid saved run ID.')
+    path = folder / 'runs' / rid / 'processing.json'
+    if path.is_symlink() or (folder / 'runs').is_symlink() or path.parent.is_symlink():
+        raise WorkspaceError('Symlink retry settings refused.')
+    if not path.exists():
+        if status.get('processing_sha256') or (run_record or {}).get('processing_sha256'):
+            raise WorkspaceError('Saved retry settings are missing; previous run retained.')
+        return original
+    if not path.is_file() or path.stat().st_size > MAX_FILE:
+        raise WorkspaceError('Saved retry settings are missing or oversized.')
+    body = path.read_bytes()
+    digest = sha(body)
+    record = json.loads(body)
+    if (not isinstance(record, dict) or record.get('schema') != 'modulus_run_processing_v1' or
+            record.get('paper_id') != original.get('paper_id') or
+            record.get('input_manifest_sha256') != sha(manifest_body) or
+            status.get('processing_sha256') != digest or
+            (run_record is not None and run_record.get('processing_sha256') != digest)):
+        raise WorkspaceError('Retry settings changed or do not match their immutable source manifest.')
+    job = record.get('job')
+    if not isinstance(job, dict) or source_identity(job) != source_identity(original):
+        raise WorkspaceError('Retry settings reference different original inputs.')
+    batch_profile(job.get('profile'))
+    return job
+
+
+def save_processing_job(folder, job, run):
+    manifest_body = (folder / 'job.json').read_bytes()
+    original = json.loads(manifest_body)
+    if job != original:
+        if source_identity(job) != source_identity(original):
+            raise WorkspaceError('Retry cannot replace immutable originals.')
+        save_json(run / 'processing.json', {'schema': 'modulus_run_processing_v1',
+            'paper_id': job['paper_id'], 'input_manifest_sha256': sha(manifest_body), 'job': job})
 
 
 def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspecified',
@@ -475,7 +556,9 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
     if path.is_symlink() or (folder / 'input').is_symlink():
         raise WorkspaceError('Symlink manifest/input directory refused.')
     if path.exists():
+        requested_job = job
         old = json.loads(path.read_text())
+        verify_saved_inputs(folder, old)
         identity, old_identity = dict(job), dict(old)
         for annotation in ('exam_intent', 'source_association'):
             identity.pop(annotation, None)
@@ -493,7 +576,29 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
         if export and 'source_export' not in old and old == legacy and cached_run(folder, job['source_export']['sha256']):
             job = old
         if old != job:
-            raise WorkspaceError('This paper ID already has different files or settings. Choose a new ID; previous work is preserved.')
+            old_sources, new_sources = source_identity(old), source_identity(job)
+            if old_sources != new_sources:
+                changed = [role for role in sorted(set(old_sources['inputs']) | set(new_sources['inputs']))
+                           if old_sources['inputs'].get(role) != new_sources['inputs'].get(role)]
+                detail = ', '.join(changed) if changed else 'source export'
+                raise WorkspaceError('This paper ID has different files or settings: ' + detail +
+                                     ' original bytes or roles changed. Previous originals and runs were kept.')
+        state_path = folder / 'status.json'
+        if state_path.is_symlink():
+            raise WorkspaceError('Symlink status refused.')
+        state = json.loads(state_path.read_text()) if state_path.is_file() else {}
+        if state.get('state') == 'ready_for_integration':
+            effective = run_processing_job(folder, state, path.read_bytes())
+            if processing_identity(effective) != processing_identity(job):
+                raise WorkspaceError('This paper ID has different files or settings: completed run settings differ. '
+                                     'Completed crops were kept; use a separate settings revision.')
+            job = effective
+        elif state.get('state') not in (None, 'held', 'processing'):
+            raise WorkspaceError('Unknown saved processing state; previous work was kept.')
+        elif source_identity(requested_job) == source_identity(old):
+            # Failed attempts use current source annotations/settings in their
+            # own snapshot without rewriting the historical root manifest.
+            job = requested_job
     for role, value in roles.items():
         if value:
             dest = folder / inputs[role]['file']
@@ -510,11 +615,17 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
 
 
 def record_status(folder, job, state, run_id, **extra):
+    if isinstance(run_id, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,119}', run_id):
+        processing = folder / 'runs' / run_id / 'processing.json'
+        if processing.is_symlink() or processing.parent.is_symlink() or (folder / 'runs').is_symlink():
+            raise WorkspaceError('Symlink retry settings refused.')
+        if processing.is_file():
+            extra['processing_sha256'] = sha(processing.read_bytes())
     save_json(folder / 'status.json', {'schema': 'modulus_shared_status_v1',
         'paper_id': job['paper_id'], 'state': state, 'run_id': run_id,
         'updated_at': now(), 'updated_by': 'mac_runner',
         'solutions': 'supplied_not_matched' if 'solutions' in job['inputs'] else 'not_supplied',
-        'publication': 'not_deployed', **extra})
+        'publication': 'not_deployed', 'profile': job['profile'], **extra})
 
 
 def finish_run(folder, job, run, archive):
@@ -528,11 +639,15 @@ def finish_run(folder, job, run, archive):
             check['marking_state'] = 'owner_selected_main_rules' if job['profile'] == 'jee-main-mock' else 'source_validation_required'
     save_json(run / 'exam.json', data)
     save_json(run / 'checks.json', check)
+    processing_extra = {}
+    if (run / 'processing.json').is_file():
+        processing_extra = {'processing_sha256': sha((run / 'processing.json').read_bytes()),
+                            'effective_profile': job['profile']}
     save_json(run / 'run.json', {'run_id': run.name, 'completed_at': now(),
         'cropper_sha256': sha((HERE / 'question_boundaries.py').read_bytes()) if (HERE / 'question_boundaries.py').is_file() else None,
         'export_sha256': check['export_sha256'],
         'key_semantics': 'preserved verbatim; a numeric answer is NOT assumed to be an option',
-        'input_manifest_sha256': sha((folder / 'job.json').read_bytes())})
+        'input_manifest_sha256': sha((folder / 'job.json').read_bytes()), **processing_extra})
     extra = {}
     if intent:
         extra = {'exam_family': intent['exam_family'], 'required_exam_pattern': intent.get('exam_pattern'),
@@ -546,7 +661,7 @@ def finish_run(folder, job, run, archive):
         next_action='Assistant: identify source sections/types, map supplied solutions, validate selected marking, test portal integration.')
 
 
-def cached_run(folder, export_sha=None):
+def cached_run(folder, export_sha=None, requested_job=None):
     status = folder / 'status.json'
     if not status.is_file():
         return False
@@ -563,6 +678,9 @@ def cached_run(folder, export_sha=None):
         if path.is_symlink() or folder not in path.resolve().parents or not path.is_file():
             raise WorkspaceError('Completed run is missing/unsafe; original run retained. Restore it before retrying.')
     previous = json.loads(run.read_text())
+    effective = run_processing_job(folder, state, (folder / 'job.json').read_bytes(), previous)
+    if requested_job is not None and processing_identity(effective) != processing_identity(requested_job):
+        return False
     if sha((run.parent / 'export.zip').read_bytes()) != previous.get('export_sha256'):
         raise WorkspaceError('Completed export changed; original run retained. Restore it before retrying.')
     data, checks = validate_export(run.parent / 'export.zip')
@@ -644,12 +762,13 @@ def _process(args):
     folder, job = prepare_job(args.root, args.paper_id, source, key, solutions,
                               args.profile, keep_color=keep_color, exam_intent=intent,
                               source_association=getattr(args, 'source_association', None))
-    if cached_run(folder):
+    if cached_run(folder, requested_job=job):
         print('Already processed with this cropper; reusing existing crops.')
         if not args.offline:
             _sync_job(folder)
         return folder
     run = new_run(folder)
+    save_processing_job(folder, job, run)
     record_status(folder, job, 'processing', run.name)
     # Local work must continue even when GitHub is unavailable. Sync once the
     # result or refusal exists, so upload retry never requires recropping.
@@ -705,12 +824,13 @@ def _attach(args):
         solutions=getattr(args, 'solutions', None), profile=args.profile,
         export=args.source, exam_intent=intent,
         source_association=getattr(args, 'source_association', None))
-    if cached_run(folder, sha(Path(args.source).read_bytes())):
+    if cached_run(folder, sha(Path(args.source).read_bytes()), requested_job=job):
         if not args.offline:
             _sync_job(folder)
         print('This export is already stored; no duplicate run created.')
         return folder
     run = new_run(folder)
+    save_processing_job(folder, job, run)
     shutil.copy2(args.source, run / 'export.zip')
     finish_run(folder, job, run, run / 'export.zip')
     if not args.offline:
