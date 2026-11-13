@@ -42,7 +42,7 @@ trap 'rm -rf "$MODULUS_UPDATE_DIR"' EXIT
 # Stage the client, cropper and its small readers together. A partial download
 # must not install a client that depends on a missing reader.
 MODULUS_UPDATE_OK=true
-for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py workspace_client.py; do
+for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py portal_bridge.py paper_enrichment.py workspace_client.py; do
   if ! curl -fsSL --max-time 15 "$BASE/$MODULUS_TOOL_FILE" -o "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" || \
      [ ! -s "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" ] || \
      ! "$MODULUS_PYTHON" -m py_compile "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE"; then
@@ -51,7 +51,7 @@ for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py 
   fi
 done
 if [ "$MODULUS_UPDATE_OK" = true ]; then
-  for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py workspace_client.py; do
+  for MODULUS_TOOL_FILE in question_boundaries.py source_layout.py source_keys.py portal_bridge.py paper_enrichment.py workspace_client.py; do
     if ! cmp -s "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE"; then
       [ ! -f "$HERE/$MODULUS_TOOL_FILE" ] || cp "$HERE/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE.previous"
       mv "$MODULUS_UPDATE_DIR/$MODULUS_TOOL_FILE" "$HERE/$MODULUS_TOOL_FILE"

@@ -6,6 +6,7 @@ existing detector in charge.
 """
 import math
 import re
+from copy import deepcopy
 from statistics import mean
 
 
@@ -20,7 +21,9 @@ _COUNTS = (
 )
 _INSTRUCTIONS = re.compile(r'\b(?:important|general)\s+instructions?\b', re.I)
 _QUESTION_SECTION = re.compile(
-    r'\bsingle\s+correct\s+answer\s+type\b|\bmultiple\s+choice\s+questions\b', re.I)
+    r'\b(?:single|multiple)\s+correct(?:\s+answers?)?\s+type\b|'
+    r'\bmultiple\s+choice\s+questions\b|'
+    r'\b(?:numerical|integer)(?:\s+(?:value|answer))?\s+type\b', re.I)
 _UNRELATED_PAGE = re.compile(
     r'^\s*(?:(?:space\s+for\s+)?rough\s*work|blank\s+page|'
     r'(?:final\s+)?answer\s*key|(?:worked\s+)?solutions?|hints?)\s*[:\-]?\s*$',
@@ -58,8 +61,12 @@ def _declared_source(pages):
     normalized = '\n'.join(title).replace('_', ' ')
     families = {(m.group(1) or m.group(2)).lower()
                 for m in _FAMILY.finditer(normalized)}
-    if families != {'main'}:
+    if (len(families) != 1 or not families <= {'main', 'advanced'}
+            or any(_FAMILY.search(line) and re.search(r'\bMain\b', line, re.I)
+                   and re.search(r'\bAdvanced\b', line, re.I)
+                   for line in normalized.splitlines())):
         return None
+    family = 'jee-' + next(iter(families))
     declarations = []
     for pi, page in enumerate(pages[:3]):
         for line in _page_text(page).splitlines():
@@ -72,7 +79,7 @@ def _declared_source(pages):
     # intended to resolve short worksheets; they retain the existing detector.
     if len(totals) != 1 or not 10 <= next(iter(totals)) <= 300:
         return None
-    return next(iter(totals)), declarations
+    return next(iter(totals)), declarations, family
 
 
 def _continuation_evidence(page):
@@ -149,7 +156,7 @@ def calibrate_single_column(pages, candidates_fn):
     source = _declared_source(pages)
     if source is None:
         return None
-    expected, declarations = source
+    expected, declarations, family = source
     declaration_pages = {item['page_index'] for item in declarations}
     instruction_pages = {pi for pi in declaration_pages
                          if _INSTRUCTIONS.search(_page_text(pages[pi]))}
@@ -236,7 +243,7 @@ def calibrate_single_column(pages, candidates_fn):
                 continuation_proof[pi] = proof
         if valid:
             proven.append({'expected_count': expected,
-                           'exam_family': 'jee-main',
+                           'exam_family': family,
                            'margin_ratio': mean(item['ratio'] for item in ordered),
                            'tolerance_ratio': tolerance,
                            'anchors_by_page': by_page,
@@ -260,6 +267,72 @@ def trusted_candidates(layout, page_index):
     return [dict(anchor) for anchor in pages[page_index]]
 
 
+def _section_marking(text, kind, page):
+    """Read only explicit labelled numbers from a pre-question instruction block."""
+    normalized = text.replace('\u2212', '-').replace('\u2013', '-').replace('\uff1a', ':')
+    number = r'([+\-]?\s*\d+(?:\.\d+)?)(?![\d.])'
+    labels = {
+        'correct': r'(Correct(?:\s+(?:Answer|Response))?|Full\s+Marks?)',
+        'incorrect': r'(Incorrect(?:\s+(?:Answer|Response))?|Negative\s+Marks?)',
+        'unanswered': r'(Unattempted|Unanswered|Zero\s+Marks?)',
+    }
+    values = {}
+    for field, label in labels.items():
+        found = []
+        for match in re.finditer(r'\b' + label + r'\s*[:=]\s*' + number, normalized, re.I):
+            value = float(match.group(2).replace(' ', ''))
+            if field == 'incorrect' and match.group(1).lower().startswith('negative'):
+                value = -abs(value)
+            found.append(value)
+        if len(set(found)) != 1 or not found or not math.isfinite(found[0]):
+            return {}
+        values[field] = int(found[0]) if found[0].is_integer() else found[0]
+    if values['correct'] <= 0 or values['incorrect'] > 0:
+        return {}
+    no_partial = bool(re.search(r'\bno\s+partial\s+(?:credit|marks)\b', normalized, re.I))
+    partial_values = {float(match.group(1).replace(' ', '')) for match in re.finditer(
+        r'\bPartial\s+Marks?\s*[:=]\s*' + number +
+        r'\s*(?:marks?\s*)?(?:per|for\s+each)\s+correct\s+option\b', normalized, re.I)}
+    if no_partial and partial_values:
+        return {}
+    if no_partial:
+        values['partial'] = {'type': 'none'}
+    elif (kind == 'multiple_correct' and len(partial_values) == 1
+          and next(iter(partial_values)) > 0):
+        values['partial'] = {'type': 'per_correct_option', 'each': next(iter(partial_values))}
+    elif kind == 'multiple_correct' or re.search(r'\bpartial\b', normalized, re.I):
+        return {}
+    return {'marking_scheme': values,
+            'marking_basis': {'basis': 'source', 'evidence': {'page': page, 'text': text}}}
+
+
+def _source_duration(pages, layout):
+    """Keep a duration only when explicit instruction-page declarations agree."""
+    declarations = []
+    patterns = (
+        re.compile(r'\b(?:Duration|Time\s+Allowed|Time)\s*[:=]\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b', re.I),
+        re.compile(r'\b(?:test|paper|examination)\s+is\s+of\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\s+duration\b', re.I),
+    )
+    for pi, page in enumerate(pages[:min(3, layout['first_page_index'] + 1)]):
+        anchors = layout['anchors_by_page'][pi]
+        if anchors:
+            stop = min(anchor['y'] for anchor in anchors)
+            text = ' '.join(w['text'] for w in sorted(page.get('words', []), key=lambda w: (w['top'], w['x0']))
+                            if w['top'] < stop)
+        else:
+            text = _page_text(page)
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                minutes = float(match.group(1)) * (60 if match.group(2).lower().startswith(('h',)) else 1)
+                if 0 < minutes <= 1440:
+                    declarations.append((minutes, {'page': pi + 1, 'text': match.group(0)}))
+    if len({value for value, _ in declarations}) != 1:
+        return {}
+    value = declarations[0][0]
+    return {'paper_duration_minutes': int(value) if value.is_integer() else value,
+            'duration_basis': {'basis': 'source', 'evidence': declarations[0][1]}}
+
+
 def source_question_types(pages, layout):
     """Read response types from explicit printed section headings, never keys.
 
@@ -272,9 +345,22 @@ def source_question_types(pages, layout):
     if len(by_page) != len(pages):
         return {}
     headings = {'SINGLE CORRECT ANSWER TYPE': 'single_choice',
-                'NUMERICAL VALUE TYPE': 'numerical'}
+                'SINGLE CORRECT TYPE': 'single_choice',
+                'MULTIPLE CORRECT ANSWER TYPE': 'multiple_correct',
+                'MULTIPLE CORRECT ANSWERS TYPE': 'multiple_correct',
+                'MULTIPLE CORRECT TYPE': 'multiple_correct',
+                'NUMERICAL VALUE TYPE': 'numerical',
+                'NUMERICAL ANSWER TYPE': 'numerical',
+                'NUMERICAL TYPE': 'numerical',
+                'INTEGER ANSWER TYPE': 'numerical',
+                'INTEGER VALUE TYPE': 'numerical',
+                'INTEGER TYPE': 'numerical'}
     normalize = lambda value: re.sub(r'[^A-Za-z0-9]+', ' ', value).strip().upper()
-    result, current = {}, None
+    result, current, current_subject = {}, None, None
+    duration = _source_duration(pages, layout)
+    subjects = {'MATHEMATICS': 'Mathematics', 'MATHS': 'Mathematics',
+                'PHYSICS': 'Physics', 'CHEMISTRY': 'Chemistry',
+                'BIOLOGY': 'Biology', 'BOTANY': 'Botany', 'ZOOLOGY': 'Zoology'}
     first, last = layout['first_page_index'], layout['last_page_index']
     for pi in range(first, last + 1):
         rows = []
@@ -297,6 +383,11 @@ def source_question_types(pages, layout):
             if i in used:
                 continue
             raw, normalized, end = row['raw'], row['normalized'], row['bottom']
+            subject_label = re.fullmatch(r'(MATHEMATICS|MATHS|PHYSICS|CHEMISTRY|BIOLOGY|BOTANY|ZOOLOGY)(?: MAX(?:IMUM)? MARKS? \d+)?', normalized)
+            if subject_label:
+                events.append((end, 2, {'subject': subjects[subject_label.group(1)],
+                                       'subject_source': {'page': pi + 1, 'text': raw,
+                                                          'basis': 'explicit_printed_subject_heading'}}))
             if normalized not in headings and i + 1 < len(rows):
                 following = rows[i + 1]
                 joined = normalized + ' ' + following['normalized']
@@ -308,6 +399,28 @@ def source_question_types(pages, layout):
                 evidence = {'source_type': headings[normalized],
                             'source_section': {'page': pi + 1, 'text': raw,
                                                'basis': 'explicit_printed_section_heading'}}
+                stop = min((anchor['y'] for anchor in by_page[pi] if anchor['y'] >= end),
+                           default=float(pages[pi]['height']))
+                instruction_rows = []
+                for following in rows[i + 1:]:
+                    if following['top'] < end:
+                        continue
+                    if (following['bottom'] > stop or following['normalized'] in headings
+                            or re.fullmatch(r'SECTION (?:[IVX]+|\d+)', following['normalized'])
+                            or following['normalized'] in subjects):
+                        break
+                    instruction_rows.append(following['raw'])
+                evidence.update(_section_marking('\n'.join(instruction_rows), headings[normalized], pi + 1))
+                instructions = ' '.join(instruction_rows)
+                conventions = []
+                for labels, basis in (('1234', 'one_based_options'), ('ABCD', 'letter_options')):
+                    pattern = r'\boptions?\b.{0,100}?' + r'.{0,25}?'.join(r'\(\s*' + label + r'\s*\)' for label in labels)
+                    if re.search(pattern, instructions, re.I):
+                        conventions.append(basis)
+                if len(conventions) == 1 and headings[normalized] in ('single_choice', 'multiple_correct'):
+                    evidence['option_key_basis'] = conventions[0]
+                    evidence['option_key_source'] = {'page': pi + 1, 'text': instructions,
+                                                     'basis': 'explicit_printed_option_convention'}
                 events.append((end, 0, evidence))
             elif (re.fullmatch(r'SECTION (?:[IVX]+|\d+)', normalized) or
                   (normalized.endswith(' TYPE') and len(normalized.split()) <= 7
@@ -315,10 +428,19 @@ def source_question_types(pages, layout):
                            ('ANSWER', 'VALUE', 'MATCH', 'MATRIX', 'INTEGER', 'COMPREHENSION')))):
                 events.append((end, 0, None))
         events.extend((anchor['y'], 1, anchor['n']) for anchor in by_page[pi])
-        for _, kind, value in sorted(events, key=lambda item: (item[0], item[1])):
+        for _, kind, value in sorted(events, key=lambda item: (item[0], item[1] == 1)):
             if kind == 0:
                 current = value
+            elif kind == 2:
+                current_subject = value
+                current = None
             elif current is not None:
                 result[value] = {'source_type': current['source_type'],
                                  'source_section': dict(current['source_section'])}
+                result[value].update(deepcopy(duration))
+                for field in ('marking_scheme', 'marking_basis', 'option_key_basis', 'option_key_source'):
+                    if field in current:
+                        result[value][field] = deepcopy(current[field])
+                if current_subject is not None:
+                    result[value].update(current_subject)
     return result

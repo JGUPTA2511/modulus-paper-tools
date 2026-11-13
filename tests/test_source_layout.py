@@ -125,11 +125,59 @@ class SourceLayoutTests(unittest.TestCase):
         pages[0]['text'] += '\nTotal questions: 15'
         self.assertIsNone(calibrate_single_column(pages, candidates))
 
-    def test_advanced_unknown_and_conflicting_family_are_not_calibrated(self):
-        for family in ('JEE Advanced', 'Unlabelled practice', 'JEE Main and JEE Advanced'):
+    def test_unknown_and_conflicting_family_are_not_calibrated(self):
+        for family in ('Unlabelled practice', 'JEE Main and JEE Advanced',
+                       'JEE Main & Advanced', 'JEE (Main/Advanced)'):
             pages = source()
             pages[0]['text'] = family + '\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
             self.assertIsNone(calibrate_single_column(pages, candidates))
+
+    def test_advanced_numerical_sequence_is_source_proven_without_option_labels(self):
+        pages = source()
+        pages[0]['text'] = 'JEE (Advanced)\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+        pages[1]['text'] = 'SECTION-I\nINTEGER ANSWER TYPE'
+        for p in pages[1:]:
+            p['words'] = [w for w in p['words'] if not re.fullmatch(r'[1-4]\)', w['text'])]
+        self.heading(pages[1], '(INTEGER ANSWER TYPE)')
+        original = deepcopy(pages)
+        layout = calibrate_single_column(pages, candidates)
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout['exam_family'], 'jee-advanced')
+        self.assertEqual([a['n'] for items in layout['anchors_by_page'] for a in items], list(range(1, 13)))
+        types = source_question_types(pages, layout)
+        self.assertEqual([types[n]['source_type'] for n in range(1, 13)], ['numerical'] * 12)
+        self.assertEqual(types[1]['source_section']['text'], '(INTEGER ANSWER TYPE)')
+        self.assertFalse(any(field in layout for field in ('duration_minutes', 'marks', 'advanced_paper')))
+        self.assertEqual(pages, original)
+
+    def test_advanced_multi_correct_and_integer_headings_preserve_response_metadata(self):
+        for multi_heading in ('MULTIPLE CORRECT ANSWER TYPE', 'MULTIPLE CORRECT TYPE'):
+            with self.subTest(heading=multi_heading):
+                pages = source()
+                pages[0]['text'] = 'JEE Advanced Paper II\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+                pages[1]['text'] = 'SECTION-I\n' + multi_heading
+                self.heading(pages[1], multi_heading)
+                self.heading(pages[3], 'INTEGER TYPE')
+                layout = calibrate_single_column(pages, candidates)
+                self.assertEqual(layout['exam_family'], 'jee-advanced')
+                types = source_question_types(pages, layout)
+                self.assertEqual([types[n]['source_type'] for n in range(1, 13)],
+                                 ['multiple_correct'] * 8 + ['numerical'] * 4)
+                self.assertEqual(types[1]['source_section']['text'], multi_heading)
+                for i, p in enumerate(pages):
+                    p['answer'] = [i % 4 + 1, (i + 1) % 4 + 1]
+                self.assertEqual(source_question_types(pages, layout), types)
+
+    def test_advanced_restarted_numbers_and_unsupported_first_section_remain_held(self):
+        pages = source()
+        pages[0]['text'] = 'JEE Advanced\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+        pages[1]['text'] = 'SECTION-I\nNUMERICAL VALUE TYPE'
+        pages[2] = page([1, 2, 3, 4])
+        self.assertIsNone(calibrate_single_column(pages, candidates))
+        pages = source()
+        pages[0]['text'] = 'JEE Advanced\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+        pages[1]['text'] = 'SECTION-I\nMATRIX MATCH TYPE'
+        self.assertIsNone(calibrate_single_column(pages, candidates))
 
     def test_paired_main_heading_is_source_evidence(self):
         pages = source()
@@ -247,11 +295,96 @@ class SourceLayoutTests(unittest.TestCase):
         self.assertEqual(source_question_types(pages, layout), {})
         self.heading(pages[1], '(SINGLE CORRECT ANSWER TYPE)')
         self.heading(pages[2], 'SECTION-II', 40)
-        self.heading(pages[2], '(INTEGER ANSWER TYPE)', 55)
+        self.heading(pages[2], '(MATRIX MATCH TYPE)', 55)
         self.heading(pages[3], '(NUMERICAL VALUE TYPE)')
         types = source_question_types(pages, layout)
         self.assertEqual(set(types), set(range(1, 5)) | set(range(9, 13)))
         self.assertEqual(source_question_types(pages, None), {})
+
+    def test_subjects_come_from_printed_headers_and_new_subject_resets_unknown_type(self):
+        pages = source()
+        self.heading(pages[1], 'PHYSICS Max Marks: 80', 20)
+        self.heading(pages[1], '(SINGLE CORRECT ANSWER TYPE)', 50)
+        self.heading(pages[2], 'CHEMISTRY', 20)
+        self.heading(pages[3], '(NUMERICAL VALUE TYPE)', 50)
+        result = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertEqual(result[1]['subject'], 'Physics')
+        self.assertEqual(result[1]['subject_source']['text'], 'PHYSICS Max Marks: 80')
+        self.assertNotIn(5, result)
+        self.assertEqual(result[9]['subject'], 'Chemistry')
+        self.assertEqual(result[9]['source_type'], 'numerical')
+
+    def test_printed_option_convention_is_preserved_without_using_stem_letters_or_keys(self):
+        pages = source()
+        self.heading(pages[1], '(SINGLE CORRECT ANSWER TYPE)', 40)
+        self.heading(pages[1], 'Each question has 4 options (1), (2), (3) and (4).', 60)
+        types = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertEqual(types[1]['option_key_basis'], 'one_based_options')
+        self.assertEqual(types[1]['option_key_source']['basis'], 'explicit_printed_option_convention')
+        for page in pages:
+            page['answer'] = 'A'
+        self.assertEqual(source_question_types(pages, calibrate_single_column(pages, candidates)), types)
+
+    def test_advanced_rules_and_duration_require_explicit_source_numbers(self):
+        pages = source()
+        pages[0]['text'] = 'JEE Advanced\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12\nDuration: 3 hours'
+        pages[1]['text'] = 'SECTION-I\nINTEGER ANSWER TYPE'
+        self.heading(pages[1], 'INTEGER ANSWER TYPE', 20)
+        self.heading(pages[1], 'Correct: +3', 40)
+        self.heading(pages[1], 'Incorrect: -2', 52)
+        self.heading(pages[1], 'Unattempted: 0', 64)
+        types = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertEqual(types[1]['marking_scheme'], {'correct': 3, 'incorrect': -2, 'unanswered': 0})
+        self.assertEqual(types[1]['marking_basis']['basis'], 'source')
+        self.assertIn('Unattempted: 0', types[1]['marking_basis']['evidence']['text'])
+        self.assertEqual(types[12]['paper_duration_minutes'], 180)
+        self.assertEqual(types[12]['duration_basis']['basis'], 'source')
+        pages[0]['text'] += '\nTime Allowed: 120 minutes'
+        result = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertNotIn('paper_duration_minutes', result[1])
+
+    def test_multiple_correct_partial_policy_is_never_assumed(self):
+        for partial, expected in ((None, None), ('No partial credit', {'type': 'none'}),
+                                  ('Partial Marks: +1 per correct option', {'type': 'per_correct_option', 'each': 1.0})):
+            with self.subTest(partial=partial):
+                pages = source()
+                pages[0]['text'] = 'JEE Advanced\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+                pages[1]['text'] = 'MULTIPLE CORRECT ANSWER TYPE'
+                self.heading(pages[1], 'MULTIPLE CORRECT ANSWER TYPE', 20)
+                self.heading(pages[1], 'Full Marks: +4', 40)
+                self.heading(pages[1], 'Negative Marks: -2', 52)
+                self.heading(pages[1], 'Zero Marks: 0', 64)
+                if partial:
+                    self.heading(pages[1], partial, 76)
+                types = source_question_types(pages, calibrate_single_column(pages, candidates))
+                if expected is None:
+                    self.assertNotIn('marking_scheme', types[1])
+                else:
+                    self.assertEqual(types[1]['marking_scheme']['partial'], expected)
+                    self.assertEqual(types[1]['marking_scheme']['incorrect'], -2)
+
+    def test_unknown_advanced_rules_never_inherit_main_or_question_text_values(self):
+        pages = source()
+        pages[0]['text'] = 'JEE Advanced\nIMPORTANT INSTRUCTIONS\nTotal Questions: 12'
+        self.heading(pages[1], 'SINGLE CORRECT ANSWER TYPE', 20)
+        self.heading(pages[1], 'Correct: +4', 40)
+        self.heading(pages[1], 'Unattempted: 0', 64)
+        # This is after the first source anchor, so it is question content,
+        # not section-level evidence for the missing incorrect rule.
+        self.heading(pages[1], 'Incorrect: -1', 115)
+        result = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertNotIn('marking_scheme', result[1])
+        self.assertNotIn('paper_duration_minutes', result[1])
+
+    def test_custom_numerical_partial_credit_is_not_silently_discarded(self):
+        pages = source()
+        self.heading(pages[1], 'NUMERICAL VALUE TYPE', 20)
+        self.heading(pages[1], 'Correct: +3', 40)
+        self.heading(pages[1], 'Incorrect: -1', 52)
+        self.heading(pages[1], 'Unattempted: 0', 64)
+        self.heading(pages[1], 'Partial credit depends on rounding', 76)
+        result = source_question_types(pages, calibrate_single_column(pages, candidates))
+        self.assertNotIn('marking_scheme', result[1])
 
 
 if __name__ == '__main__':

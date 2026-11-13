@@ -2,6 +2,16 @@
 
 This public repository contains **code only**. Never upload question papers, answer keys, solutions, student data, crop images, or credentials here.
 
+## Current reusable pipeline
+
+Use the same trusted Mac launcher, select the existing folder and choose the shared or mixed marking policy. Unchanged failed jobs retry under their existing IDs; originals and earlier runs stay immutable. Complete source-proven images can be saved before a key is available. Adding or correcting a key later creates an immutable metadata revision that reuses every crop byte.
+
+The saved upload queue first syncs the private `paper-workspace` handoff. When source completeness, question types, subjects, keys and marking evidence are sufficient, it also stages only that run's export and integration manifest under private `development:paper_imports/<PAPER-ID>/<RUN-ID>/`. The reusable development importer installs those records in the **existing** catalogue and exam interface. Other papers continue if one is held. No whole-branch workspace merge, full repository clone or per-paper Netlify build is used.
+
+Main and Advanced retain their distinct existing controls and scoring. Numerical zero and answers 1–4 stay numerical; multiple-correct answers require source types. Known explicit source headings/rules are read conservatively; unknown layouts, reset numbering, matrix grading and unclear rules stay held with reasons. Source keys remain provisional rather than mathematically verified. Worked solution PDFs are stored; they are not automatically matched.
+
+Development staging is not live publication. The existing Netlify build includes the reusable importer, and one approved batch release can publish validated papers. All staging commits carry `[skip ci] [skip netlify]`; this tool does not change live `main` or deploy a paper. Local processing/API transfers do not consume Actions minutes. Network failures retry without recropping, including development staging.
+
 Claude maintains `question_boundaries.py` (the existing Mac cropper). ChatGPT maintains the original `workspace_client.py` private handoff; Codex added batch orchestration and retry protections around it. The existing `Run_Question_Boundaries.command` launcher is retained. Cropping and watermark reduction are unchanged and run locally, with no paid service or AI API.
 
 Private workspace: `JGUPTA2511/modulus-practice-corner`, branch `paper-workspace`, folder `paper_jobs/<PAPER-ID>/`. Uploading here is **not** deploying an examination. App integration stays on `development`; live `main` is untouched.

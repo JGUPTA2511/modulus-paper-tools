@@ -14,7 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 FILES = ('question_boundaries.py', 'source_layout.py', 'source_keys.py',
-         'workspace_client.py')
+         'portal_bridge.py', 'paper_enrichment.py', 'workspace_client.py')
 
 
 class UpdateBundleTests(unittest.TestCase):
@@ -64,7 +64,7 @@ done
 printf '%s\\n' "$file" >> "$MODULUS_TEST_REQUEST_LOG"
 # Every request must still see the complete installed old set. This catches
 # replacements performed before all downloads/compiles have staged.
-for name in question_boundaries.py source_layout.py source_keys.py workspace_client.py; do
+for name in question_boundaries.py source_layout.py source_keys.py portal_bridge.py paper_enrichment.py workspace_client.py; do
   if [ -f "$MODULUS_TEST_SAVED/$name" ]; then
     cmp -s "$MODULUS_TEST_SAVED/$name" "$MODULUS_TEST_INSTALL/$name" || exit 92
   elif [ -e "$MODULUS_TEST_INSTALL/$name" ]; then
