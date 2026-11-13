@@ -136,7 +136,7 @@ class PDFCompatibilityTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec('pypdf'), 'Optional encrypted-fixture writer unavailable')
     def test_password_required_pdf_is_distinguished_from_parser_failure(self):
         from pypdf import PdfWriter
-        source = self.base / 'Password required.pdf'
+        source = self.base / 'Encrypted.pdf'
         writer = PdfWriter()
         writer.add_blank_page(width=120, height=100)
         writer.encrypt('synthetic-password')
@@ -145,8 +145,39 @@ class PDFCompatibilityTests(unittest.TestCase):
         before = source.read_bytes()
         with self.assertRaises(w.WorkspaceError) as failure:
             w.strict_pdf(source)
-        self.assertIn('password', str(failure.exception).lower())
+        self.assertEqual(str(failure.exception),
+                         'PDF requires a password before processing: Encrypted.pdf')
         self.assertEqual(source.read_bytes(), before)
+
+    def test_direct_and_known_wrapped_password_errors_are_classified(self):
+        from pdfminer.pdfdocument import PDFPasswordIncorrect
+        from pdfplumber.utils.exceptions import PdfminerException
+        source = compatible_pdf(self.base / 'Encrypted.pdf')
+        original = source.read_bytes()
+        in_args = PdfminerException(PDFPasswordIncorrect())
+        in_cause = PdfminerException('PDF document initialization failed')
+        in_cause.__cause__ = PDFPasswordIncorrect()
+        in_context = PdfminerException('PDF document initialization failed')
+        in_context.__context__ = PDFPasswordIncorrect()
+        for failure in (PDFPasswordIncorrect(), in_args, in_cause, in_context):
+            with self.subTest(wrapper=type(failure).__name__), \
+                 patch.object(pdfplumber, 'open', side_effect=failure):
+                with self.assertRaises(w.WorkspaceError) as error:
+                    w.strict_pdf(source)
+                self.assertEqual(str(error.exception),
+                                 'PDF requires a password before processing: Encrypted.pdf')
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_other_wrapped_parser_failures_are_not_called_password_errors(self):
+        from pdfplumber.utils.exceptions import PdfminerException
+        source = compatible_pdf(self.base / 'Parser error.pdf')
+        failure = PdfminerException(ValueError('Synthetic parser failure'))
+        with patch.object(pdfplumber, 'open', side_effect=failure):
+            with self.assertRaises(w.WorkspaceError) as error:
+                w.strict_pdf(source)
+        self.assertEqual(str(error.exception),
+                         'PDF preflight check failed (PdfminerException): Parser error.pdf. '
+                         'Original file kept unchanged.')
 
     @unittest.skipUnless(importlib.util.find_spec('pypdf'), 'Optional encrypted-fixture writer unavailable')
     def test_viewable_copy_restricted_pdf_does_not_require_a_password(self):

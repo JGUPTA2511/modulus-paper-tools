@@ -50,8 +50,10 @@ Owner's Mac screenshot confirms loose QP/KEY-&-SOLS/FINAL-KEY files in one folde
 
 The unchanged key reader scans combined PDFs and uses pages with>=10parsed keys; it still has Advanced/multiple-answer limitations. Source headings with paired parentheses are recognised and ambiguous families remain unresolved. Old immutable manifest bytes are preserved when only annotation metadata is added; changed originals/scoring still require a new ID. Combined input roles share one uploaded Git blob. No app/grade/deployment change is part of this correction.
 
-## Prepared PDF validator correction (awaiting actual QP sample)
+## PDF validator and printed-title compatibility correction
 
 Owner reports that all QPs open normally but batch preflight labels them unreadable/corrupt/password-protected. Reproduced an internal validator bug on valid indirect Contents arrays: PDFObjRef has no get_data. Resolve references, require PDFStream and then decode. Keep size/header/page checks; do not blanket-label parser/programming failures as corrupt/password-protected. This changes preflight only, not the accepted cropper or cleaning.
 
-The recurring failures mean a representative actual QP should be tested privately before another rollout/restart instruction. Synthetic renderer compatibility is now tested, but it is not proof of these unseen source files or the owner's Mac. Actual paper data/results must remain outside this public code repo.
+Known pdfplumber wrappers of PDFPasswordIncorrect retain the dedicated password diagnostic; unrelated parser wrappers stay controlled preflight errors. Printed title labels using underscore separators are matched without changing their evidence text, source bytes, conflict checks or Advanced part requirements. No filename/answer-value inference is introduced.
+
+Before further rollout claims, read the latest private `docs/MODULUS_PROJECT_CONTEXT.md` and `handoff/codex.json` for owner-source access and validation evidence. Actual paper data/results remain outside this public code repo. Public verification is 247 synthetic Linux tests plus compilation, shell syntax and diff checks; it does not prove a complete Mac crop/upload or exam launch. Reuse the trusted launcher and unchanged source folder; do not ask for routine renaming/conversion/reinstallation.

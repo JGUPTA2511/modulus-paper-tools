@@ -64,6 +64,62 @@ class SourceEvidenceTests(unittest.TestCase):
                 self.assertEqual(result['marking_state'], 'source_validation_required')
                 self.assertIsNone(result['verified_rules'])
 
+    def test_underscore_title_labels_match_without_changing_source_evidence(self):
+        for i, (title, family, pattern, part) in enumerate([
+            ('_Jee-Main_Practice_Set_', 'jee-main', 'jee-main', None),
+            ('_J.E.E._Main_(Practice)_', 'jee-main', 'jee-main', None),
+            ('_JEE_Advanced_Paper1_', 'jee-advanced', 'jee-advanced-1', 'paper_1'),
+            ('_JEE_Advanced_Paper_II_', 'jee-advanced', 'jee-advanced-2', 'paper_2'),
+            ('_JEE_Advanced_Both_Papers_', 'jee-advanced', 'jee-advanced-both', 'both'),
+            ('_JEE_Advanced_Paper_I_and_Paper_II_', 'jee-advanced', 'jee-advanced-both', 'both'),
+        ]):
+            with self.subTest(title=title):
+                path = self.source(title, 'Synthetic_' + str(i) + '.pdf')
+                original = path.read_bytes()
+                result = w.inspect_exam_source(source=path)
+                self.assertEqual(result['exam_family'], family)
+                self.assertEqual(result['exam_pattern'], pattern)
+                self.assertEqual(result['advanced_paper'], part)
+                self.assertEqual(result['family_evidence'][0]['text'], title)
+                self.assertEqual(result['source_pdf_sha256'], w.sha(original))
+                self.assertIsNone(result['verified_rules'])
+                self.assertFalse(result['launch_ready'])
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_underscore_title_conflicts_and_unspecified_parts_remain_unresolved(self):
+        for i, title in enumerate(('_JEE_Main_and_JEE_Advanced_',
+                                   '_JEE_Main_and_Advanced_')):
+            with self.subTest(title=title):
+                result = w.inspect_exam_source(source=self.source(title, str(i) + '.pdf'))
+                self.assertEqual(result['exam_family'], 'unknown')
+                self.assertIsNone(result['exam_pattern'])
+                self.assertTrue(result['errors'])
+                self.assertEqual(result['family_evidence'][0]['text'], title)
+        for i, title in enumerate(('_JEE_Advanced_Practice_',
+                                   '_JEE_Advanced_Paper1_Paper2_')):
+            with self.subTest(title=title):
+                result = w.inspect_exam_source(source=self.source(title, 'Part_' + str(i) + '.pdf'))
+                self.assertEqual(result['exam_family'], 'jee-advanced')
+                self.assertIsNone(result['exam_pattern'])
+                self.assertIsNone(result['advanced_paper'])
+
+    def test_underscore_standalone_part_and_general_instructions_remain_distinct(self):
+        source = self.source('Synthetic backing PDF')
+        text = '_JEE_Advanced_\n_Paper_II_\nBoth_papers_are_compulsory\n'
+        with patch('pdfplumber.open', return_value=self.pages([text])):
+            result = w.inspect_exam_source(source=source)
+        self.assertEqual(result['exam_pattern'], 'jee-advanced-2')
+        self.assertEqual(result['advanced_paper'], 'paper_2')
+        self.assertEqual(result['family_evidence'][0]['text'], '_JEE_Advanced_')
+
+    def test_underscore_title_does_not_hide_pdf_export_conflicts(self):
+        source = self.source('_JEE_Main_Practice_')
+        result = w.inspect_exam_source(source=source,
+                                      export=self.archive(exam_pattern='jee-advanced-1'))
+        self.assertEqual(result['exam_family'], 'unknown')
+        self.assertIsNone(result['exam_pattern'])
+        self.assertTrue(any('conflict' in reason for reason in result['errors']))
+
     def test_advanced_without_source_part_never_defaults_to_paper_one(self):
         result = w.inspect_exam_source(source=self.source('JEE Advanced MOCK'))
         self.assertEqual(result['exam_family'], 'jee-advanced')
