@@ -11,3 +11,11 @@ The Mac launcher updates from this public repo, crops locally, and uploads direc
 Structural checks verify sequential numbers, readable images, image references and nonempty source keys. They do not prove boundaries or solve questions. Answers are preserved verbatim; 1-4 may be numerical responses. Separate solutions PDFs are preserved but matching remains an integration task. Supported explicit mock profile: JEE Main +4/-1/0, 180 minutes. No unspecified paper receives that profile automatically.
 
 The first authenticated Mac sync is still an installation-level check to perform on the owner's Mac. Passing local tests is not proof of a Mac login/upload or a student-facing deployment.
+
+## Batch addition (Codex)
+
+`workspace_client.py batch FOLDER` and the existing interactive launcher now discover one input subfolder per paper. Canonical filenames and optional paper.json select associations; no question/key guessing occurs. Completed exports are reused unchanged. Marking is explicitly selected for the batch, with mixed/per-paper overrides. Original cropper/cleaning code remains unchanged.
+
+The shared paper lock now covers preparation, cropping, attachment and sync. Local work finishes before upload, so network retries reuse completed runs. Export identity and opt-in color settings are immutable; cached artifacts are checked before reuse/sync. Legacy attached manifests are retained for exact matching exports. Batch output and local JSON reports stay outside input folders; failures are isolated and no review tabs open in batch mode.
+
+Codex owns `handoff/codex.json`, both the private root implementation-session note and per-paper notes when Codex actually works on a paper. It never overwrites Claude/ChatGPT notes or the Mac's status to claim deployment. The Mac uploader does not generate assistant notes. Private durable context: `paper-workspace:docs/MODULUS_PROJECT_CONTEXT.md`; read its latest version in future sessions. No app branch or question-bank changes are part of this batch feature.
