@@ -49,3 +49,9 @@ Audits found cropper key grammar/options threshold/longest-chain limitations for
 Owner's Mac screenshot confirms loose QP/KEY-&-SOLS/FINAL-KEY files in one folder; the old one-real-subfolder rule held every file. Exact same-prefix companion grouping is now automatic before the complete-file/grouped modes, so keys are not treated as separate question papers. FINAL-KEY has priority; combined PDF is stored as unmatched solutions, or used for both key and supplied solutions when no separate key exists. Record source_association; duplicate/unknown/mismatched sources stay held. Do not ask the owner to move/rename these originals.
 
 The unchanged key reader scans combined PDFs and uses pages with>=10parsed keys; it still has Advanced/multiple-answer limitations. Source headings with paired parentheses are recognised and ambiguous families remain unresolved. Old immutable manifest bytes are preserved when only annotation metadata is added; changed originals/scoring still require a new ID. Combined input roles share one uploaded Git blob. No app/grade/deployment change is part of this correction.
+
+## Prepared PDF validator correction (awaiting actual QP sample)
+
+Owner reports that all QPs open normally but batch preflight labels them unreadable/corrupt/password-protected. Reproduced an internal validator bug on valid indirect Contents arrays: PDFObjRef has no get_data. Resolve references, require PDFStream and then decode. Keep size/header/page checks; do not blanket-label parser/programming failures as corrupt/password-protected. This changes preflight only, not the accepted cropper or cleaning.
+
+The recurring failures mean a representative actual QP should be tested privately before another rollout/restart instruction. Synthetic renderer compatibility is now tested, but it is not proof of these unseen source files or the owner's Mac. Actual paper data/results must remain outside this public code repo.

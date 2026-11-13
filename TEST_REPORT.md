@@ -1,3 +1,13 @@
+# Prepared PDF preflight correction — 13 November 2026
+
+Status: feature-branch correction prepared; actual owner QP sample still required before another Mac rollout. **241 tests passed** with `python -m unittest discover -s tests -v` on Linux (229prior+12PDF compatibility). Python compilation, both shell syntax checks and `git diff --check` passed. Prepared client blob: `f8c538c9fd0b9793ff0693077bbcbddff53c573e`. Cropper SHA remains unchanged `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+Confirmed defect: valid PDF page Contents arrays can contain indirect PDFObjRef objects. Calling get_data directly on those references raised AttributeError, then a broad handler mislabeled the file unreadable/corrupt/password-protected. The correction resolves each reference and explicitly requires PDFStream before decoding; it does not coerce malformed non-stream values into empty valid content. Generic parser failures now name the actual exception class, while a genuine PDFPasswordIncorrect gets its own password message. Three prior corrupt-fixture tests now assert the truthful preflight-failure category instead of requiring the old misleading word.
+
+The new proper-xref fixtures cover direct streams, single/multiple indirect arrays, an indirect array object, Flate compression, image-only/blank PDFs, malformed non-stream contents, true password protection versus viewable copy restriction, size/symlink safeguards, unchanged originals and companion intake. Actual Linux pdfinfo/pdftoppm parsed and rendered the valid compressed fixture successfully; pdfplumber extracted its text. A separate read-only probe also rendered these synthetic structures with the unchanged cropper renderer. No real owner paper, actual Mac environment, real OCR or mathematical key verification was exercised. No broad parser fallback or validation bypass was added.
+
+The actual source files remain on the owner's Mac and all were held before crop/job creation. One affected QP is needed to confirm the prepared correction against the real producer/version before asking for another restart. Any real-paper diagnostic/test result belongs in private records, never this public code repository.
+
 # Flat same-ID companions — 13 November 2026
 
 Current result: **229 tests passed** using `python -m unittest discover -s tests -v` in Linux (189prior +24 companion grouping +9 pipeline +7 unchanged-key/heading tests). Python compilation, both shell syntax checks and `git diff --check` passed. Tested client blob: `2effda9b5870f374bef3ff4dcb0352f5ec2cbc57`. Cropper SHA is unchanged: `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.

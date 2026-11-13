@@ -1385,6 +1385,7 @@ def strict_pdf(path):
     path = input_pdf(path)
     try:
         import pdfplumber
+        from pdfminer.pdftypes import PDFStream, resolve1
         with pdfplumber.open(path) as doc:
             if not doc.pages:
                 raise ValueError('no pages')
@@ -1393,12 +1394,21 @@ def strict_pdf(path):
                     raise ValueError('invalid page size')
                 # Resolve content streams too, without OCR or rendering.
                 for stream in page.page_obj.contents:
-                    stream.get_data()
+                    resolved = resolve1(stream)
+                    if not isinstance(resolved, PDFStream):
+                        raise ValueError('invalid page content stream')
+                    resolved.get_data()
                 page.objects
     except ImportError as exc:
         raise WorkspaceError('PDF validation needs pdfplumber. Run the Mac launcher to install it.') from exc
     except Exception as exc:
-        raise WorkspaceError('Unreadable/corrupt or password-protected PDF: ' + path.name) from exc
+        # A parser/programming failure is not evidence that a viewable source is
+        # corrupt or encrypted. Name the actual failure class for diagnostics.
+        from pdfminer.pdfdocument import PDFPasswordIncorrect
+        if isinstance(exc, PDFPasswordIncorrect):
+            raise WorkspaceError('PDF requires a password before processing: ' + path.name) from exc
+        raise WorkspaceError('PDF preflight check failed (' + type(exc).__name__ + '): ' +
+                             path.name + '. Original file kept unchanged.') from exc
     return path
 
 

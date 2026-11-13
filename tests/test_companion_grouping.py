@@ -149,7 +149,7 @@ class CompanionGroupingTests(unittest.TestCase):
             stream.truncate(w.MAX_FILE + 1)
         self.paper('GTM-30_QP.pdf')
         rows = self.by_id()
-        self.assertIn('corrupt', rows['GTM-28']['reason'])
+        self.assertIn('PDF preflight check failed', rows['GTM-28']['reason'])
         self.assertIn('24 MiB', rows['GTM-29']['reason'])
         self.assertIsNone(rows['GTM-30']['reason'])
 
