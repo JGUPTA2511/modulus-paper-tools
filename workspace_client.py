@@ -118,19 +118,61 @@ def safe_member(name):
 
 
 def path_from_prompt(text):
-    text = text.strip()
-    if not text:
+    if not text or text.isspace():
         return None
-    # Handle Finder's escaped spaces, single quotes and double quotes; no eval.
-    if Path(text).expanduser().exists():
-        return Path(text).expanduser().absolute()
+    if '\0' in text:
+        raise WorkspaceError('A file path cannot contain a null character.')
+    # Finder may escape a literal trailing space as "\\ ". Do not strip input:
+    # that would leave a dangling escape before shlex gets to read it.
+    literal = Path(text).expanduser()
+    try:
+        if literal.exists():
+            return literal.absolute()
+    except OSError:
+        pass  # A multi-file drag can be too long to be a single literal path.
     try:
         parts = shlex.split(text)
     except ValueError as exc:
-        raise WorkspaceError('Could not read the dragged path.') from exc
+        # Recover an old, already-trimmed Finder path only when the filesystem
+        # identifies exactly one destination. Ambiguous repairs stay unselected.
+        matches = set()
+        if text.endswith('\\'):
+            for repair in (text + ' ', text[:-1]):
+                try:
+                    names = shlex.split(repair)
+                    if len(names) == 1:
+                        candidate = Path(names[0]).expanduser()
+                        if candidate.exists():
+                            matches.add(candidate.absolute())
+                except (ValueError, OSError):
+                    continue
+        if len(matches) == 1:
+            return matches.pop()
+        raise WorkspaceError('Could not read the dragged path. Press Enter at the paper prompt to choose the batch folder.') from exc
     if len(parts) != 1:
         raise WorkspaceError('Drag ONE file or batch folder into each prompt, not several paths.')
     return Path(parts[0]).expanduser().absolute()
+
+
+def choose_batch_folder():
+    """Native macOS folder selection, without shell escaping or renamed inputs."""
+    if sys.platform != 'darwin':
+        raise WorkspaceError('The folder chooser is available on macOS. Drag or paste a folder path here.')
+    script = 'POSIX path of (choose folder with prompt "Choose the folder containing your paper subfolders")'
+    result = subprocess.run(['osascript', '-e', script], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        if '-128' in result.stderr:  # The owner cancelled the standard dialog.
+            return None
+        raise WorkspaceError('The folder chooser could not open. You can still drag or paste the folder path.')
+    # osascript adds a protocol newline; spaces inside the returned path are data.
+    selected = result.stdout.rstrip('\r\n')
+    if not selected:
+        return None
+    path = Path(selected).expanduser().absolute()
+    if not path.is_dir():
+        raise WorkspaceError('The selected folder was not found.')
+    return path
 
 
 def input_pdf(path):
@@ -1141,22 +1183,25 @@ def _interactive_loop(pause_uploads=None, wake_uploads=None):
     print('Pending uploads retry while this window is open; closing keeps the saved queue.')
     print('Your PDFs/results go ONLY to the private repository. No Netlify deployment.')
     print('Drag a BATCH FOLDER, a question PDF OR an existing result ZIP.')
+    print('Or press Enter to choose the batch folder in a normal folder dialog.')
     print('Type g to connect GitHub when convenient, or q to finish. Login is not needed to process papers.')
     while True:
         if pause_uploads is not None:
             pause_uploads.clear()
         if wake_uploads is not None:
             wake_uploads.set()
-        raw = input('\nBatch folder / question PDF / result ZIP > ').strip()
+        raw = input('\nBatch folder / question PDF / result ZIP (Enter: Choose Folder) > ')
         if pause_uploads is not None:
             pause_uploads.set()
-        if raw.lower() == 'q':
+        if raw.strip().lower() == 'q':
             return
         try:
-            if raw.lower() == 'g':
+            if raw.strip().lower() == 'g':
                 connect_github()
                 continue
-            path = path_from_prompt(raw)
+            path = choose_batch_folder() if not raw.strip() else path_from_prompt(raw)
+            if path is None:
+                continue
             if path is not None and path.is_dir():
                 interactive_batch(path)
                 continue
