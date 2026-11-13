@@ -1,3 +1,11 @@
+# Finder paths and native folder selection — 13 November 2026
+
+Current result: **145 tests passed** with `python -m unittest discover -s tests -v` on Linux (125 retained tests plus20 new Finder/chooser regressions). Python compilation, both shell launcher syntax checks and `git diff --check` passed. Tested client Git blob: `b6075658268332ba7dec9e53cd67d05742767806`. Cropper SHA-256 remains `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+The owner supplied a real Mac screenshot of repeated path-reader failure. The code defect was trimming raw input before shlex could decode an escaped trailing space, leaving a dangling backslash. Tests generate folders ending in one/multiple spaces and cover Finder separators, existing literal/quoted Unicode/apostrophe/backslash paths, unique legacy recovery, ambiguous/multi-path rejection, symlink identity and shell-expression nonexecution. Interactive tests prove the main prompt now passes raw input unchanged.
+
+The main Mac prompt also offers Enter for a standard Choose Folder dialog through fixed osascript arguments. Tests mock chooser output/error/cancellation and verify literal path preservation and quiet cancellation. No user text is executed as shell/AppleScript code, and blank optional key/solutions inputs retain their meaning. Native macOS dialog operation and a completed real-paper Mac run have not been observed; the tests are synthetic/mocked. No cropper, upload protocol, app branch or deployment was changed.
+
 # Login-gate correction — 13 November 2026
 
 Current executed result: **125 tests passed** using `python -m unittest discover -s tests -v` on Linux. This retains 113 prior tests and includes three actual-Bash startup tests plus nine local-first processing tests. Python compilation, both launcher shell syntax checks and `git diff --check` passed. Client Git blob: `8459d55cefed8d8de92e0696d77a277dadadebb3`; runner blob: `f2ed07e8fa0063b9d0d56b3e4cd38be325a3fb51`.
