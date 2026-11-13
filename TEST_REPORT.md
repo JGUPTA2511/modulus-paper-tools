@@ -1,3 +1,7 @@
+# Safe held-job retry — 13 November 2026
+
+328 synthetic Linux tests pass: 317 retained plus 11 retry regressions. A formerly unspecified held job can select Main settings and complete under the same ID while preserving the original manifest, source bytes and refusal run. Tests cover filename aliases, current settings snapshots, completed-crop reuse, duplicate-free simulated sync, changed source/key rejection, tampered/symlink originals, the shared lock and modified retry evidence. Compilation and diff checks pass. No real owner job, actual Mac retry, paper transfer or deployed exam is established by these tests.
+
 # Source detection and correction-sheet compatibility — 13 November 2026
 
 317 synthetic Linux tests passed with `python -m unittest discover -s tests -v` (247 retained +28 source-key +21 layout/section metadata +12 client +5 cropper geometry +4 staged updater tests). OpenCV is an existing Mac runtime dependency; cloud geometry tests used it from an isolated temporary test directory. Compilation, both shell syntax checks and diff checks passed. API operations remain simulated in tests.
