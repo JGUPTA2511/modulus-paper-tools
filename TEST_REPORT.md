@@ -1,3 +1,15 @@
+# Mixed paper inventory, source evidence and interface intent — 13 November 2026
+
+Current result: **189 tests passed** with `python -m unittest discover -s tests -v` on Linux:145 prior,15 complete-file inventory,18 source evidence,11 mixed-policy integration. Python compilation, both shell syntax checks and `git diff --check` passed. Client Git blob: `01e8a8c5151af1e43a6329cffaa318eeed6f4b0f`. Cropper SHA remains unchanged `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+New cases cover every loose/nested candidate in an explicitly declared complete-paper collection, stable IDs, unsafe/corrupt/oversized inputs, duplicate/PDF-export ambiguity, Word sidecars without blocking their PDF copy, source-title/export metadata classification, verbatim instruction snippets with pages/hashes, source/evidence limits, unknown scans/conflicts, separate Main/Advanced1/2 intent, Main scoring only on Main sources, no default Advanced part/rules/duration, unchanged existing exports and numerical zero, immutable legacy cache reuse, refused-paper isolation and actual offline CLI intake. Synthetic cropper/API calls do not prove the cropper supports Advanced layouts.
+
+Read-only development audit at `a23c770ec4c86560f05b64d7aab4058574460618` confirmed existing pattern-specific instructions, answer controls and Advanced grader. Existing pure Advanced-grader Node tests passed in a temporary copy; this is separate synthetic evidence, not a browser exam or deployment test. No app files changed. The Main/Advanced patterns share a renderer shell but use different behaviour; batch metadata intent does not itself switch or deploy it.
+
+The actual unchanged cropper was audited, and synthetic key/gate probes showed real limitations: multiple-correct keys/fractions are not generally parsed, numerical-heavy inputs can fail the option threshold, and restarted subject/section numbering can lose questions/overwrite keys. New mixed jobs/checks/status explicitly hold exam launch pending source-scoped completeness/type/marking validation. Source text evidence is collected, not converted into independently verified Advanced grading rules. No claim is made that arbitrary Advanced papers are now supported completely.
+
+The owner confirmed sources are only on the Mac; no source PDFs for this folder were present in the private workspace at inspection. No actual folder contents, real-paper crop/upload, native Mac GUI or Main/Advanced exam run was verified in this task. No new paid AI, cloud processing, Actions pipeline, portal build or deployment occurred.
+
 # Finder paths and native folder selection — 13 November 2026
 
 Current result: **145 tests passed** with `python -m unittest discover -s tests -v` on Linux (125 retained tests plus20 new Finder/chooser regressions). Python compilation, both shell launcher syntax checks and `git diff --check` passed. Tested client Git blob: `b6075658268332ba7dec9e53cd67d05742767806`. Cropper SHA-256 remains `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.

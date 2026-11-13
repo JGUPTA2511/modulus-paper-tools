@@ -411,7 +411,7 @@ def _sync_job(folder, api=None, queue_on_error=True):
 
 
 def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspecified',
-                export=None, keep_color=False):
+                export=None, keep_color=False, exam_intent=None):
     pid = paper_id(pid)
     root = Path(root).expanduser().resolve()
     folder = root / pid
@@ -427,6 +427,16 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
                             'sha256': sha(p.read_bytes()), 'size': p.stat().st_size}
     job = {'schema': 'modulus_shared_paper_v1', 'paper_id': pid, 'inputs': inputs,
            'profile': profile, 'profile_basis': 'owner_selected' if profile != 'unspecified' else 'not_selected'}
+    if profile == 'jee-advanced-source':
+        job['profile_basis'] = 'source_required'
+    if exam_intent is not None:
+        if not isinstance(exam_intent, dict) or exam_intent.get('exam_family') not in ('jee-main', 'jee-advanced', 'unknown'):
+            raise WorkspaceError('Invalid per-paper exam family metadata.')
+        if profile == 'jee-main-mock' and exam_intent['exam_family'] == 'jee-advanced':
+            raise WorkspaceError('Main marking cannot be applied to an Advanced source paper.')
+        if profile == 'jee-advanced-source' and exam_intent['exam_family'] == 'jee-main':
+            raise WorkspaceError('Advanced interface cannot be assigned to a Main source paper.')
+        job['exam_intent'] = exam_intent
     if export:
         p = Path(export)
         job['source_export'] = {'original_name': p.name, 'sha256': sha(p.read_bytes()),
@@ -441,10 +451,16 @@ def prepare_job(root, pid, source=None, key=None, solutions=None, profile='unspe
         raise WorkspaceError('Symlink manifest/input directory refused.')
     if path.exists():
         old = json.loads(path.read_text())
+        legacy_intent = dict(job)
+        legacy_intent.pop('exam_intent', None)
+        if 'exam_intent' not in old and old == legacy_intent:
+            job = old  # Do not rewrite an immutable legacy manifest for annotations.
         # Legacy attach manifests did not contain the export identity. Reuse an
         # exact completed export without rewriting that immutable manifest.
         legacy = dict(job)
         legacy.pop('source_export', None)
+        if 'exam_intent' not in old:
+            legacy.pop('exam_intent', None)
         if export and 'source_export' not in old and old == legacy and cached_run(folder, job['source_export']['sha256']):
             job = old
         if old != job:
@@ -473,6 +489,12 @@ def record_status(folder, job, state, run_id, **extra):
 
 def finish_run(folder, job, run, archive):
     data, check = validate_export(archive)
+    intent = job.get('exam_intent')
+    if intent:
+        check['exam_intent'] = intent
+        check['exam_launch_ready'] = False
+        check['source_completeness'] = 'unverified_requires_source_scoped_question_counts'
+        check['marking_state'] = 'owner_selected_main_rules' if job['profile'] == 'jee-main-mock' else 'source_validation_required'
     save_json(run / 'exam.json', data)
     save_json(run / 'checks.json', check)
     save_json(run / 'run.json', {'run_id': run.name, 'completed_at': now(),
@@ -480,7 +502,12 @@ def finish_run(folder, job, run, archive):
         'export_sha256': check['export_sha256'],
         'key_semantics': 'preserved verbatim; a numeric answer is NOT assumed to be an option',
         'input_manifest_sha256': sha((folder / 'job.json').read_bytes())})
-    record_status(folder, job, 'ready_for_integration', run.name, questions=data['count'],
+    extra = {}
+    if intent:
+        extra = {'exam_family': intent['exam_family'], 'required_exam_pattern': intent.get('exam_pattern'),
+                 'integration_state': 'held_pending_source_type_marking_and_completeness_validation',
+                 'exam_launch_ready': False}
+    record_status(folder, job, 'ready_for_integration', run.name, questions=data['count'], **extra,
         next_action='Assistant: identify source sections/types, map supplied solutions, validate selected marking, test portal integration.')
 
 
@@ -542,8 +569,11 @@ def _process(args):
     for p in (key, solutions):
         if p:
             input_pdf(p)
+    intent = getattr(args, 'exam_intent', None)
+    if intent is None and args.profile in ('jee-main-mock', 'jee-advanced-source'):
+        intent = inspect_exam_source(source=source)
     folder, job = prepare_job(args.root, args.paper_id, source, key, solutions,
-                              args.profile, keep_color=keep_color)
+                              args.profile, keep_color=keep_color, exam_intent=intent)
     if cached_run(folder):
         print('Already processed with this cropper; reusing existing crops.')
         if not args.offline:
@@ -593,10 +623,13 @@ def attach(args):
 def _attach(args):
     # Existing accepted export: upload unchanged, do NOT recrop.
     validate_export(args.source)
+    intent = getattr(args, 'exam_intent', None)
+    if intent is None and args.profile in ('jee-main-mock', 'jee-advanced-source'):
+        intent = inspect_exam_source(source=getattr(args, 'source_pdf', None), export=args.source)
     folder, job = prepare_job(args.root, args.paper_id,
         source=getattr(args, 'source_pdf', None), key=getattr(args, 'key', None),
         solutions=getattr(args, 'solutions', None), profile=args.profile,
-        export=args.source)
+        export=args.source, exam_intent=intent)
     if cached_run(folder, sha(Path(args.source).read_bytes())):
         if not args.offline:
             _sync_job(folder)
@@ -765,7 +798,334 @@ def start_queue_worker(root, interval=60, pause_event=None, wake_event=None):
     return stop, thread
 
 
-PROFILES = ('unspecified', 'jee-main-mock')
+def _all_paper_id(relative):
+    """Stable identity from the source path, independent of its current bytes."""
+    path = PurePosixPath(relative)
+    value = path.with_suffix('').as_posix()
+    # Word originals may sit beside their PDF copies. Keep the PDF identity
+    # stable while giving each unsupported Word candidate its own held record.
+    if path.suffix.lower() in ('.doc', '.docx'):
+        value += '-' + path.suffix[1:].upper()
+    clean = re.sub(r'[^A-Z0-9_-]+', '-', value.upper()).strip('-_')
+    if not clean:
+        clean = 'PAPER-' + sha(value.encode())[:12].upper()
+    if len(clean) > 80:
+        clean = clean[:67].rstrip('-_') + '-' + sha(value.encode())[:12].upper()
+    return paper_id(clean)
+
+
+def discover_all_papers(source, root):
+    """Inventory an explicitly declared collection of complete paper files.
+
+    This mode never associates similarly named keys/solutions automatically.
+    Every PDF/ZIP is one source candidate; Word/unsafe inputs are held visibly.
+    The earlier one-subfolder-per-paper discovery remains separate and intact.
+    """
+    source = Path(source).expanduser()
+    if source.is_symlink() or not source.is_dir():
+        raise WorkspaceError('Batch input must be a real folder, not a symlink.')
+    source = source.resolve()
+    root = Path(root).expanduser().resolve()
+    if source == root or source in root.parents or root in source.parents:
+        raise WorkspaceError('Keep batch input and generated job folders separate; neither may contain the other.')
+    entries = []
+    ignored_directories = {'.git', '.venv', '__pycache__', '__MACOSX'}
+    extensions = {'.pdf', '.zip', '.doc', '.docx'}
+
+    def record(path, reason=None):
+        relative = path.relative_to(source).as_posix()
+        item = {'folder': str(path.parent), 'paper_id': _all_paper_id(relative),
+                'profile': 'unspecified', 'files': {}, 'hashes': {},
+                'reason': reason, 'source_relative_path': relative,
+                'source_file': str(path), 'discovery_mode': 'complete_paper_files'}
+        entries.append(item)
+        try:
+            item['inventory'] = sorted(p.name for p in path.parent.iterdir() if not p.name.startswith('.'))
+            if reason:
+                return item
+            if path.is_symlink() or not path.is_file():
+                raise WorkspaceError('Symlink/special source file refused: ' + path.name)
+            if path.stat().st_size > MAX_FILE:
+                raise WorkspaceError('Input exceeds the 24 MiB per-file limit: ' + path.name)
+            if path.suffix.lower() in ('.doc', '.docx'):
+                raise WorkspaceError('Word documents need a PDF copy; original names/files remain unchanged: ' + path.name)
+            canonical = 'export.zip' if path.suffix.lower() == '.zip' else 'questions.pdf'
+            item['files'][canonical] = str(path)
+            if canonical == 'export.zip':
+                validate_export(path)
+            else:
+                strict_pdf(path)
+            item['hashes'][canonical] = sha(path.read_bytes())
+        except (WorkspaceError, OSError, ValueError, TypeError) as exc:
+            item['reason'] = str(exc)
+        return item
+
+    def walk_error(exc):
+        # Permission errors must be visible; never silently omit a subtree.
+        path = Path(exc.filename) if exc.filename else source
+        if path == source:
+            raise WorkspaceError('Could not read the batch input folder.') from exc
+        record(path, 'Folder could not be inspected: ' + path.name)
+
+    for current, directories, filenames in os.walk(source, followlinks=False, onerror=walk_error):
+        parent = Path(current)
+        for name in sorted(list(directories), key=lambda n: (n.casefold(), n)):
+            path = parent / name
+            if name in ignored_directories:
+                directories.remove(name)
+            elif path.is_symlink():
+                directories.remove(name)
+                record(path, 'Symlink folder refused; its contents were not followed: ' + name)
+        directories.sort(key=lambda n: (n.casefold(), n))
+        for name in sorted(filenames, key=lambda n: (n.casefold(), n)):
+            if name == '.DS_Store':
+                continue
+            path = parent / name
+            if path.suffix.lower() in extensions:
+                record(path)
+    if not entries:
+        raise WorkspaceError('No PDF, export ZIP or Word source candidates found in the selected folder.')
+    entries.sort(key=lambda item: (item['source_relative_path'].casefold(), item['source_relative_path']))
+
+    groups = {}
+    ids = {}
+    for item in entries:
+        path = PurePosixPath(item['source_relative_path'])
+        groups.setdefault((str(path.parent).casefold(), path.stem.casefold()), []).append(item)
+        ids.setdefault(item['paper_id'], []).append(item)
+    for members in groups.values():
+        suffixes = {PurePosixPath(item['source_relative_path']).suffix.lower() for item in members}
+        if {'.pdf', '.zip'} <= suffixes:
+            for item in members:
+                message = 'PDF and export ZIP share a paper name; associate them explicitly in one paper subfolder to reuse the export without recropping.'
+                item['reason'] = (item['reason'] + ' ' if item['reason'] else '') + message
+    for pid, duplicates in ids.items():
+        if len(duplicates) > 1:
+            for item in duplicates:
+                message = 'Duplicate paper ID ' + pid + '; all candidates with this ID are held.'
+                item['reason'] = (item['reason'] + ' ' if item['reason'] else '') + message
+    return entries
+
+
+SOURCE_EVIDENCE_MAX_PAGES = 200
+SOURCE_EVIDENCE_MAX_SNIPPETS = 80
+SOURCE_EVIDENCE_MAX_CHARS = 50000
+SOURCE_EVIDENCE_TITLE_LINES = 12
+
+
+def _source_title_intent(text):
+    """Read explicit first-page headings; filenames and answer values are irrelevant."""
+    lines = [line for line in text.splitlines() if line.strip()][:SOURCE_EVIDENCE_TITLE_LINES]
+    label = re.compile(r'\bJ\.?\s*E\.?\s*E\.?\s*[-:]?\s*(Main|Advanced)\b', re.I)
+    evidence = [line for line in lines if label.search(line)]
+    families = {'jee-' + match.group(1).lower() for line in evidence for match in label.finditer(line)}
+    if len(families) != 1:
+        return 'unknown', None, None, evidence
+    family = families.pop()
+    if family == 'jee-main':
+        return family, 'jee-main', None, evidence
+    # Paper identity must be in a title/standalone label. General instructions
+    # such as "Both papers are compulsory" do not turn Paper I into a pair.
+    standalone = re.compile(r'^\s*(?:(?:Combined\s+)?Both\s+Papers|Papers?\s*[-:]?\s*(?:1|2|I|II)(?:\s*(?:and|&)\s*(?:Paper\s*)?(?:2|II))?)(?:\s*\([^)]*\))?\s*$', re.I)
+    heading = '\n'.join(line for line in lines if line in evidence or standalone.fullmatch(line))
+    one = bool(re.search(r'\bPaper\s*[-:]?\s*(?:1|I)\b', heading, re.I))
+    two = bool(re.search(r'\bPaper\s*[-:]?\s*(?:2|II)\b', heading, re.I))
+    both = bool(re.search(r'\bBoth\s+Papers\b|\bPapers?\s*(?:1|I)\s*(?:and|&)\s*(?:Paper\s*)?(?:2|II)\b', heading, re.I))
+    if both:
+        return family, 'jee-advanced-both', 'both', evidence
+    if one != two:
+        part = 'paper_1' if one else 'paper_2'
+        return family, 'jee-advanced-1' if one else 'jee-advanced-2', part, evidence
+    return family, None, None, evidence
+
+
+def _source_export_intent(data, document_sha):
+    """Use explicit existing portal metadata only, preserving all source answers."""
+    known = {'jee-main': ('jee-main', 'jee-main', None),
+             'jee_main': ('jee-main', 'jee-main', None),
+             'jee-advanced': ('jee-advanced', None, None),
+             'jee_advanced': ('jee-advanced', None, None),
+             'jee-advanced-1': ('jee-advanced', 'jee-advanced-1', 'paper_1'),
+             'jee-advanced-2': ('jee-advanced', 'jee-advanced-2', 'paper_2'),
+             'jee-advanced-both': ('jee-advanced', 'jee-advanced-both', 'both')}
+    declarations = []
+    for key in ('exam_pattern', 'exam_family'):
+        if key in data:
+            declarations.append((key, data[key]))
+    rows = data.get('questions', [])
+    if isinstance(rows, list):
+        for i, row in enumerate(rows):
+            if isinstance(row, dict) and 'exam_pattern' in row:
+                declarations.append((f'questions[{i}].exam_pattern', row['exam_pattern']))
+    evidence, intents, invalid = [], [], False
+    for location, value in declarations:
+        evidence.append({'origin': 'export_metadata', 'location': location,
+                         'text': value if isinstance(value, str) else '[invalid declaration]',
+                         'document_sha256': document_sha})
+        if not isinstance(value, str) or value not in known:
+            invalid = True
+        else:
+            intents.append(known[value])
+    families = {item[0] for item in intents}
+    if invalid or len(families) != 1:
+        return 'unknown', None, None, evidence
+    family = families.pop()
+    if family == 'jee-main':
+        return family, 'jee-main', None, evidence
+    parts = {item[2] for item in intents if item[2] is not None}
+    explicit = data.get('advanced_paper')
+    if explicit in ('paper_1', 'paper_2', 'both'):
+        parts.add(explicit)
+        evidence.append({'origin': 'export_metadata', 'location': 'advanced_paper',
+                         'text': explicit, 'document_sha256': document_sha})
+    # A combined exam needs an explicit top-level combined declaration.
+    if data.get('exam_pattern') == 'jee-advanced-both' or explicit == 'both':
+        return family, 'jee-advanced-both', 'both', evidence
+    if len(parts) == 1:
+        part = parts.pop()
+        return family, {'paper_1': 'jee-advanced-1', 'paper_2': 'jee-advanced-2',
+                        'both': 'jee-advanced-both'}[part], part, evidence
+    return family, None, None, evidence
+
+
+def inspect_exam_source(source=None, export=None):
+    """Collect source evidence for later validation; never invent scoring or types.
+
+    Text-only inspection deliberately leaves scanned sources unresolved. This is
+    neither OCR nor a mathematical check, and never changes the accepted cropper.
+    """
+    result = {'schema': 'modulus_source_evidence_v1', 'exam_family': 'unknown',
+              'exam_pattern': None, 'advanced_paper': None, 'source_sha256': None,
+              'source_pdf_sha256': None, 'source_export_sha256': None,
+              'evidence_type': 'none', 'family_evidence': [], 'instruction_evidence': [],
+              'total_pages': None, 'pages_examined': 0, 'truncated': False,
+              'limits': {'pages': SOURCE_EVIDENCE_MAX_PAGES,
+                         'snippets': SOURCE_EVIDENCE_MAX_SNIPPETS,
+                         'characters': SOURCE_EVIDENCE_MAX_CHARS,
+                         'title_lines': SOURCE_EVIDENCE_TITLE_LINES},
+              'truncation_reasons': [], 'verified_rules': None,
+              'marking_state': 'source_validation_required', 'launch_ready': False,
+              'status': 'evidence_pending', 'errors': []}
+    intents = []
+    if source is not None:
+        try:
+            import pdfplumber
+            if Path(source).expanduser().is_symlink():
+                raise WorkspaceError('Symlink source refused')
+            path = input_pdf(source)
+            result['source_pdf_sha256'] = sha(path.read_bytes())
+            result['source_sha256'] = result['source_pdf_sha256']
+            result['evidence_type'] = 'pdf_text_unverified'
+            words = re.compile(r'\b(?:marks?|marking|partial|correct|incorrect|negative|unanswered|unattempted|section|duration|minutes?|hours?|time\s+allowed)\b', re.I)
+            chars = 0
+            with pdfplumber.open(path) as doc:
+                result['total_pages'] = len(doc.pages)
+                if not doc.pages:
+                    raise ValueError('no pages')
+                if len(doc.pages) > SOURCE_EVIDENCE_MAX_PAGES:
+                    result['truncation_reasons'].append('pages_limit')
+                for page_number, page in enumerate(doc.pages[:SOURCE_EVIDENCE_MAX_PAGES], 1):
+                    text = page.extract_text() or ''
+                    result['pages_examined'] += 1
+                    if page_number == 1:
+                        family, pattern, part, title = _source_title_intent(text)
+                        if family != 'unknown':
+                            intents.append((family, pattern, part))
+                        result['family_evidence'] += [
+                            {'origin': 'pdf_text_unverified', 'page': 1, 'text': line,
+                             'document_sha256': result['source_pdf_sha256']} for line in title]
+                        if title and family == 'unknown':
+                            result['errors'].append('First-page exam family is ambiguous.')
+                    lines = text.splitlines(keepends=True)
+                    relevant = {i for i, line in enumerate(lines) if words.search(line)}
+                    # Preserve complete extracted lines with their immediate context.
+                    selected = set()
+                    for i in relevant:
+                        selected.update(range(max(0, i - 1), min(len(lines), i + 2)))
+                    groups = []
+                    for i in sorted(selected):
+                        if not groups or i != groups[-1][-1] + 1:
+                            groups.append([i])
+                        else:
+                            groups[-1].append(i)
+                    for group in groups:
+                        if len(result['instruction_evidence']) >= SOURCE_EVIDENCE_MAX_SNIPPETS:
+                            if 'snippets_limit' not in result['truncation_reasons']:
+                                result['truncation_reasons'].append('snippets_limit')
+                            break
+                        snippet = ''.join(lines[i] for i in group)
+                        remaining = SOURCE_EVIDENCE_MAX_CHARS - chars
+                        if len(snippet) > remaining:
+                            if 'characters_limit' not in result['truncation_reasons']:
+                                result['truncation_reasons'].append('characters_limit')
+                            # Do not present a cut mathematical instruction as verbatim.
+                            continue
+                        result['instruction_evidence'].append(
+                            {'page': page_number, 'text': snippet,
+                             'document_sha256': result['source_pdf_sha256'],
+                             'evidence_type': 'pdf_text_unverified'})
+                        chars += len(snippet)
+            if not result['family_evidence'] and not result['instruction_evidence']:
+                result['evidence_type'] = 'pdf_text_unavailable'
+                result['errors'].append('No usable title/instruction text; scanned sources need local OCR or source review.')
+        except Exception as exc:
+            result['errors'].append('Could not inspect source PDF (' + type(exc).__name__ + ').')
+    if export is not None:
+        try:
+            path = Path(export)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FILE:
+                raise WorkspaceError('Unsafe/oversized export')
+            export_sha = sha(path.read_bytes())
+            result['source_export_sha256'] = export_sha
+            if result['source_sha256'] is None:
+                result['source_sha256'] = export_sha
+                result['evidence_type'] = 'export_metadata_unverified'
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                if len({item.filename for item in entries}) != len(entries):
+                    raise WorkspaceError('Duplicate ZIP entries')
+                if sum(item.file_size for item in entries) > MAX_EXPANDED:
+                    raise WorkspaceError('Oversized expanded archive')
+                for item in entries:
+                    safe_member(item.filename)
+                    if stat.S_ISLNK(item.external_attr >> 16) or item.flag_bits & 1:
+                        raise WorkspaceError('Unsafe ZIP entry')
+                info = archive.getinfo('exam.json')
+                if info.file_size > MAX_FILE:
+                    raise WorkspaceError('Oversized exam metadata')
+                data = json.loads(archive.read(info))
+            if not isinstance(data, dict):
+                raise WorkspaceError('Malformed exam metadata')
+            family, pattern, part, evidence = _source_export_intent(data, export_sha)
+            result['family_evidence'] += evidence
+            if family != 'unknown':
+                intents.append((family, pattern, part))
+            elif evidence:
+                result['errors'].append('Export exam family metadata is ambiguous or unsupported.')
+        except Exception as exc:
+            result['errors'].append('Could not inspect export metadata (' + type(exc).__name__ + ').')
+    families = {item[0] for item in intents}
+    if len(families) == 1 and not any('family' in error for error in result['errors']):
+        family = families.pop()
+        result['exam_family'] = family
+        patterns = {item[1] for item in intents if item[1] is not None}
+        parts = {item[2] for item in intents if item[2] is not None}
+        if family == 'jee-main':
+            result['exam_pattern'] = 'jee-main'
+        elif len(patterns) == 1 and len(parts) <= 1:
+            result['exam_pattern'] = patterns.pop()
+            result['advanced_paper'] = parts.pop() if parts else None
+        elif len(patterns) > 1:
+            result['errors'].append('Advanced paper-part declarations conflict; part remains unresolved.')
+    elif len(families) > 1:
+        result['errors'].append('PDF and export exam families conflict; no interface selected.')
+    result['truncated'] = bool(result['truncation_reasons'])
+    if result['family_evidence'] or result['instruction_evidence']:
+        result['status'] = 'evidence_collected_requires_validation'
+    return result
+
+
+PROFILES = ('unspecified', 'jee-main-mock', 'jee-advanced-source')
 
 
 def strict_pdf(path):
@@ -792,7 +1152,7 @@ def strict_pdf(path):
 
 def batch_profile(value):
     if value not in PROFILES:
-        raise WorkspaceError('Profile must be unspecified or jee-main-mock (explicit owner selection).')
+        raise WorkspaceError('Profile must be unspecified, jee-main-mock or jee-advanced-source.')
     return value
 
 
@@ -971,6 +1331,7 @@ def discover_batch(source, root, profile='unspecified', overrides=None, select_f
                     raise WorkspaceError('paper.json accepts only paper_id, profile, files and ignore.')
                 item['paper_id'] = paper_id(settings.get('paper_id', item['paper_id']))
                 item['profile'] = batch_profile(settings.get('profile', profile))
+                item['profile_explicit'] = 'profile' in settings
             paper_id(item['paper_id'])
             item['inventory'] = sorted(p.name for p in directory.iterdir() if not p.name.startswith('.'))
             candidates = {}
@@ -1002,6 +1363,7 @@ def discover_batch(source, root, profile='unspecified', overrides=None, select_f
                 item['hashes'][name] = sha(p.read_bytes())
             if item['paper_id'] in overrides:
                 item['profile'] = batch_profile(overrides[item['paper_id']])
+                item['profile_explicit'] = True
         except (WorkspaceError, OSError, ValueError, TypeError) as exc:
             item['reason'] = str(exc)
     if not entries:
@@ -1033,6 +1395,43 @@ def show_batch(entries):
                 print('    Word originals left unused and unchanged: ' + ', '.join(item['unprocessed_documents']))
 
 
+def apply_batch_exam_policy(entries, policy=None):
+    """Keep source-backed UI intent separate from unverified grading metadata."""
+    if policy not in (None, 'main-standard-advanced-source'):
+        raise WorkspaceError('Unsupported batch exam policy.')
+    for item in entries:
+        if item['reason'] or (policy is None and item['profile'] not in ('jee-main-mock', 'jee-advanced-source')):
+            continue
+        files = item['files']
+        intent = inspect_exam_source(source=files.get('questions.pdf'), export=files.get('export.zip'))
+        family = intent['exam_family']
+        if policy and not item.get('profile_explicit'):
+            item['profile'] = {'jee-main': 'jee-main-mock', 'jee-advanced': 'jee-advanced-source'}.get(family, 'unspecified')
+        if family == 'jee-advanced' and item['profile'] == 'jee-main-mock':
+            item['reason'] = 'Advanced source conflicts with selected Main marking; original/settings preserved.'
+        if family == 'jee-main' and item['profile'] == 'jee-advanced-source':
+            item['reason'] = 'Main source conflicts with selected Advanced interface; original/settings preserved.'
+        item['exam_intent'] = intent
+        item['exam_policy'] = policy or 'source_required'
+    return entries
+
+
+def _batch_entries(args, overrides):
+    if getattr(args, 'all_papers', False):
+        entries = discover_all_papers(args.source, args.root)
+        for item in entries:
+            item['profile'] = args.profile
+            if item['paper_id'] in overrides:
+                item['profile'] = overrides[item['paper_id']]
+                item['profile_explicit'] = True
+        if set(overrides) - {item['paper_id'] for item in entries}:
+            raise WorkspaceError('Profile override references an unknown paper ID.')
+    else:
+        entries = discover_batch(args.source, args.root, args.profile, overrides,
+                                 select_files=getattr(args, 'select_files', False))
+    return apply_batch_exam_policy(entries, getattr(args, 'exam_policy', None))
+
+
 def run_batch(args, entries=None):
     overrides = {}
     for value in getattr(args, 'paper_profile', []) or []:
@@ -1041,8 +1440,7 @@ def run_batch(args, entries=None):
             raise WorkspaceError('Use each --paper-profile ID=PROFILE once.')
         overrides[pid] = batch_profile(profile)
     if entries is None:
-        entries = discover_batch(args.source, args.root, args.profile, overrides,
-                                 select_files=getattr(args, 'select_files', False))
+        entries = _batch_entries(args, overrides)
         show_batch(entries)
     report_dir = Path(args.root).expanduser().resolve() / '.batch_reports'
     if report_dir.is_symlink() or (report_dir.exists() and not report_dir.is_dir()):
@@ -1069,7 +1467,7 @@ def run_batch(args, entries=None):
                 source_pdf=Path(files['questions.pdf']) if 'export.zip' in files and 'questions.pdf' in files else None,
                 key=files.get('answer_key.pdf'), solutions=files.get('solutions.pdf'),
                 root=args.root, paper_id=pid, profile=item['profile'], offline=True,
-                keep_color=args.keep_color, no_review=True)
+                keep_color=args.keep_color, no_review=True, exam_intent=item.get('exam_intent'))
             previous = json.loads((folder / 'status.json').read_text()) if (folder / 'status.json').is_file() else {}
             if 'export.zip' in files:
                 attach(run_args)
@@ -1078,6 +1476,11 @@ def run_batch(args, entries=None):
             current = json.loads((folder / 'status.json').read_text())
             reused = previous.get('run_id') == current.get('run_id')
             row['run_id'] = current['run_id']
+            if item.get('exam_intent'):
+                row['exam_family'] = item['exam_intent']['exam_family']
+                row['required_exam_pattern'] = item['exam_intent'].get('exam_pattern')
+                row['integration_state'] = 'held_pending_source_type_marking_and_completeness_validation'
+                row['exam_launch_ready'] = False
             if args.offline:
                 row.update(outcome='already processed' if reused else 'upload failed/local-only',
                            reason='Local results retained; offline mode selected.')
@@ -1093,6 +1496,8 @@ def run_batch(args, entries=None):
                                reason=None, commit=receipt['commit'])
                 except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
                     row.update(outcome='upload failed/local-only', reason=str(exc) + ' Upload queued; crops are saved and retry without recropping.')
+            if row.get('integration_state'):
+                row['reason'] = (row['reason'] + ' ' if row['reason'] else '') + 'Exam launch held: validate source sections, completeness and marking in the required Main/Advanced flow.'
         except Exception as exc:
             row['reason'] = str(exc)
             # A refusal is useful to collaborators, but never hide it behind an upload error.
@@ -1120,23 +1525,35 @@ def run_batch(args, entries=None):
 
 def interactive_batch(path):
     root = Path.home() / 'Modulus Papers'
+    all_papers = False
+    loose = any(p.suffix.lower() in ('.pdf', '.zip', '.doc', '.docx') for p in path.iterdir() if p.is_file())
+    nested = any(p.is_dir() and not p.is_symlink() and not p.name.startswith('.') and
+                 any(child.is_dir() and not child.name.startswith('.') for child in p.iterdir()) for p in path.iterdir())
+    if loose or nested:
+        print('This folder has loose files or nested folders. File associations will not be guessed.')
+        choice = input('a = every PDF/ZIP is a complete paper (scan all subfolders); Enter = use one grouped subfolder per paper > ').strip().lower()
+        all_papers = choice == 'a'
     # Discover associations before requesting shared settings; paper.json overrides remain explicit.
-    entries = discover_batch(path, root, select_files=True)
+    entries = discover_all_papers(path, root) if all_papers else discover_batch(path, root, select_files=True)
     show_batch(entries)
-    choice = input('\nMarking: y = JEE Main MOCK (+4/-1/0, 180 min); m = mixed; Enter = unspecified\n(per-paper paper.json profiles take precedence) > ').strip().lower()
+    choice = input('\nMarking: x = Main standard / Advanced from source; y = Main-only mock (+4/-1/0, 180 min); m = manual overrides; Enter = unspecified\n(per-paper paper.json profiles take precedence) > ').strip().lower()
     profile = 'jee-main-mock' if choice == 'y' else 'unspecified'
     overrides = {}
     if choice == 'm':
         for item in entries:
             if not item['reason']:
-                answer = input(item['paper_id'] + ': y = JEE mock, n = unspecified, Enter = keep ' + item['profile'] + ' > ').strip().lower()
-                if answer in ('y', 'n'):
-                    overrides[item['paper_id']] = 'jee-main-mock' if answer == 'y' else 'unspecified'
+                answer = input(item['paper_id'] + ': y = Main mock, a = Advanced source rules, n = unspecified, Enter = keep ' + item['profile'] + ' > ').strip().lower()
+                if answer in ('y', 'a', 'n'):
+                    overrides[item['paper_id']] = {'y': 'jee-main-mock', 'a': 'jee-advanced-source', 'n': 'unspecified'}[answer]
     # No files have been processed yet. Refresh the plan with selected settings.
-    entries = discover_batch(path, root, profile, overrides)
-    print('Selected marking: ' + ', '.join(item['paper_id'] + '=' + item['profile'] for item in entries if not item['reason']))
     args = argparse.Namespace(source=path, root=root, profile=profile, offline=False,
-                              keep_color=False, paper_profile=[], queue_uploads=True)
+                              keep_color=False, paper_profile=[], queue_uploads=True, all_papers=all_papers,
+                              exam_policy='main-standard-advanced-source' if choice == 'x' else None)
+    entries = _batch_entries(args, overrides)
+    print('Selected marking: ' + ', '.join(item['paper_id'] + '=' + item['profile'] for item in entries if not item['reason']))
+    if choice == 'x':
+        print('Source text determines Main/Advanced intent. Scanned/unknown types stay unresolved; no filename/answer-based guesses.')
+        print('Advanced source instructions are collected for validation, not assigned invented marks. Existing cropper may refuse unsupported keys/layouts.')
     return run_batch(args, entries)
 
 
@@ -1250,7 +1667,7 @@ def main():
         sub.add_argument('source', type=Path)
         sub.add_argument('--paper-id', required=True)
         sub.add_argument('--root', type=Path, default=Path.home() / 'Modulus Papers')
-        sub.add_argument('--profile', choices=('unspecified', 'jee-main-mock'), default='unspecified')
+        sub.add_argument('--profile', choices=PROFILES, default='unspecified')
         sub.add_argument('--offline', action='store_true', help='Keep results local; sync later.')
         if name == 'run':
             sub.add_argument('--key', type=Path)
@@ -1261,6 +1678,8 @@ def main():
     sub.add_argument('--root', type=Path, default=Path.home() / 'Modulus Papers')
     sub.add_argument('--profile', choices=PROFILES, default='unspecified')
     sub.add_argument('--select-files', action='store_true', help='Select ambiguous file roles without renaming originals.')
+    sub.add_argument('--all-papers', action='store_true', help='Explicitly treat each PDF/ZIP as a complete paper and scan nested folders.')
+    sub.add_argument('--exam-policy', choices=('main-standard-advanced-source',))
     sub.add_argument('--paper-profile', action='append', default=[], metavar='ID=PROFILE')
     sub.add_argument('--offline', action='store_true')
     sub.add_argument('--keep-color', action='store_true')
