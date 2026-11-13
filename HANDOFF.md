@@ -14,8 +14,14 @@ The first authenticated Mac sync is still an installation-level check to perform
 
 ## Batch addition (Codex)
 
-`workspace_client.py batch FOLDER` and the existing interactive launcher now discover one input subfolder per paper. Canonical filenames and optional paper.json select associations; no question/key guessing occurs. Completed exports are reused unchanged. Marking is explicitly selected for the batch, with mixed/per-paper overrides. Original cropper/cleaning code remains unchanged.
+`workspace_client.py batch FOLDER` and the existing interactive launcher now discover one input subfolder per paper. Original PDF/ZIP filenames are preserved. Canonical role names remain compatible; ambiguous roles are explicitly selected and hash-bound choices persist outside the source folders. Optional paper.json files/ignore mappings are supported; no question/key guessing occurs. Completed exports are reused unchanged. Marking is explicitly selected for the batch, with mixed/per-paper overrides. Original cropper/cleaning code remains unchanged.
 
 The shared paper lock now covers preparation, cropping, attachment and sync. Local work finishes before upload, so network retries reuse completed runs. Export identity and opt-in color settings are immutable; cached artifacts are checked before reuse/sync. Legacy attached manifests are retained for exact matching exports. Batch output and local JSON reports stay outside input folders; failures are isolated and no review tabs open in batch mode.
 
 Codex owns `handoff/codex.json`, both the private root implementation-session note and per-paper notes when Codex actually works on a paper. It never overwrites Claude/ChatGPT notes or the Mac's status to claim deployment. The Mac uploader does not generate assistant notes. Private durable context: `paper-workspace:docs/MODULUS_PROJECT_CONTEXT.md`; read its latest version in future sessions. No app branch or question-bank changes are part of this batch feature.
+
+## Original-name and queue follow-up
+
+The owner cannot rename source files. Never make canonical filenames a prerequisite. Numbered selections happen before cropping and are saved under local `.batch_selections`; input folders are unchanged. DOCX is unsupported directly; Word-only inputs are held, while Word originals beside a PDF remain untouched. A screenshot of an old launcher/results prompt does not establish current Mac installation or usable crops.
+
+Actual API upload failures enqueue under local `.upload_queue`. The launcher retries idle uploads with persistent backoff, pauses new retries during local work, and resumes saved work on the next launch. Original/export processing is never repeated by the queue. Queue revisions preserve concurrent enqueues; existing private-target, immutable-file and job-lock checks still apply. Failed GitHub sign-in is nonfatal to local processing. No queue worker runs after the tool is closed and no hosted processing/deployment is created. GitHub Actions minutes are not consumed by local cropping or API file uploads.
