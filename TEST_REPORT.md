@@ -1,3 +1,13 @@
+# Login-gate correction — 13 November 2026
+
+Current executed result: **125 tests passed** using `python -m unittest discover -s tests -v` on Linux. This retains 113 prior tests and includes three actual-Bash startup tests plus nine local-first processing tests. Python compilation, both launcher shell syntax checks and `git diff --check` passed. Client Git blob: `8459d55cefed8d8de92e0696d77a277dadadebb3`; runner blob: `f2ed07e8fa0063b9d0d56b3e4cd38be325a3fb51`.
+
+The regression reproduces the observed interruption by providing a synthetic gh command that would consume the first input line as a credential answer if invoked. The actual Bash runner starts the local client with the original paper path intact and **never invokes gh**, brew, pip or venv creation when packages are available. Separate executions verify reuse of an installed .venv without system Python/Homebrew and reuse of installed Python packages without creating a new environment. Dependency/network programs are controlled stubs, not real Mac installation tests.
+
+Local-first tests finish two synthetic papers and save both upload jobs without any foreground GitHub/API call, then drain those jobs through the simulated API without recropping. Unchanged repeats create no duplicate runs/commits. Tests also cover explicit-only Connect, noninteractive browser-login arguments, immediate idle-worker wakeup, refusal reason preservation and truthful local-only reporting if a safe queue cannot be saved.
+
+Owner screenshots are evidence of a real Mac security prompt, successful package installation and a Git login question; they do not establish completed paper processing, private upload or a working end-to-end exam. This correction has not been observed running on the owner's Mac. Optional browser authorisation remains necessary for private sync when not already signed in. Cropper SHA-256 remains unchanged: `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`. No real-paper processing, paid service, hosted pipeline, portal build or live deployment was performed.
+
 # Original filenames and durable upload queue — 13 November 2026
 
 Executed in the Linux cloud workspace with synthetic fixtures only:

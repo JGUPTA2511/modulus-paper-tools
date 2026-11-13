@@ -695,7 +695,7 @@ def drain_queue(root, api=None, force=True):
     return results
 
 
-def start_queue_worker(root, interval=60, pause_event=None):
+def start_queue_worker(root, interval=60, pause_event=None, wake_event=None):
     """Resume saved uploads while this launcher is open; closing keeps the queue."""
     import threading
     stop = threading.Event()
@@ -712,7 +712,10 @@ def start_queue_worker(root, interval=60, pause_event=None):
                 # The interactive/local processing flow must keep working.
                 # Existing queue records retain the actionable upload error.
                 pass
-            if stop.wait(interval):
+            if wake_event is not None:
+                wake_event.wait(interval)
+                wake_event.clear()
+            elif stop.wait(interval):
                 break
 
     thread = threading.Thread(target=retry, name='modulus-upload-queue', daemon=True)
@@ -1036,6 +1039,11 @@ def run_batch(args, entries=None):
             if args.offline:
                 row.update(outcome='already processed' if reused else 'upload failed/local-only',
                            reason='Local results retained; offline mode selected.')
+            elif getattr(args, 'queue_uploads', False):
+                row.update(outcome='upload failed/local-only', reason='Local results kept; upload queue could not yet be saved.')
+                queue_sync(folder)
+                row.update(outcome='already processed' if reused else 'upload failed/local-only',
+                           reason='Local processing complete; upload saved for background sync.', upload_state='queued')
             else:
                 try:
                     receipt = sync_job(folder)
@@ -1049,10 +1057,13 @@ def run_batch(args, entries=None):
             try:
                 state = json.loads((folder / 'status.json').read_text())
                 if state.get('state') == 'held' and not args.offline:
-                    sync_job(folder)
+                    if getattr(args, 'queue_uploads', False):
+                        queue_sync(folder, state.get('reason', 'Paper held'))
+                    else:
+                        sync_job(folder)
             except Exception as upload_exc:
                 row['upload_note'] = str(upload_exc)
-        print('BATCH: ' + pid + ' | ' + row['outcome'] + (' | ' + row['reason'] if row['reason'] else ''))
+        print('BATCH: ' + pid + ' | ' + ('local-only / upload queued' if row.get('upload_state') == 'queued' else row['outcome']) + (' | ' + row['reason'] if row['reason'] else ''))
     if report_dir.is_symlink():
         raise WorkspaceError('Batch results kept, but report directory became a symlink; report write refused.')
     report = report_dir / (dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8] + '.json')
@@ -1060,7 +1071,7 @@ def run_batch(args, entries=None):
         'input_folder': str(Path(args.source).expanduser().resolve()), 'publication': 'not_deployed', 'papers': results})
     print('\nBATCH COMPLETE — private workspace handoff, not a deployed examination')
     for row in results:
-        print('  ' + row['paper_id'] + ': ' + row['outcome'] + (' — ' + row['reason'] if row['reason'] else ''))
+        print('  ' + row['paper_id'] + ': ' + ('local-only / upload queued' if row.get('upload_state') == 'queued' else row['outcome']) + (' — ' + row['reason'] if row['reason'] else ''))
     print('Batch report: ' + str(report))
     return results
 
@@ -1083,35 +1094,68 @@ def interactive_batch(path):
     entries = discover_batch(path, root, profile, overrides)
     print('Selected marking: ' + ', '.join(item['paper_id'] + '=' + item['profile'] for item in entries if not item['reason']))
     args = argparse.Namespace(source=path, root=root, profile=profile, offline=False,
-                              keep_color=False, paper_profile=[])
+                              keep_color=False, paper_profile=[], queue_uploads=True)
     return run_batch(args, entries)
+
+
+def connect_github():
+    """Explicit browser login only; never read/paste a token or configure Git interactively."""
+    if shutil.which('gh') is None:
+        brew = shutil.which('brew')
+        if brew is None:
+            print('GitHub connection is unavailable; local paper work and saved uploads remain available.')
+            return False
+        print('Installing the free GitHub upload helper...')
+        if subprocess.run([brew, 'install', 'gh'], check=False).returncode:
+            print('Upload helper installation failed; pending uploads remain saved.')
+            return False
+    print('Approve the connection in your GitHub browser window. Local results stay saved.')
+    # Non-interactive stdin suppresses gh's unrelated Git-credential setup question.
+    # Explicit --web keeps the owner-approved browser authorization flow.
+    env = dict(os.environ, GH_PROMPT_DISABLED='1')
+    result = subprocess.run(['gh', 'auth', 'login', '--hostname', 'github.com',
+                             '--web', '--git-protocol', 'https'],
+                            stdin=subprocess.DEVNULL, env=env, check=False)
+    if result.returncode:
+        print('Connection was not completed. You can keep processing papers; uploads remain queued.')
+        return False
+    print('GitHub connected. Pending uploads will resume automatically.')
+    return True
 
 
 def interactive():
     import threading
     pause = threading.Event()
-    stop, worker = start_queue_worker(Path.home() / 'Modulus Papers', pause_event=pause)
+    wake = threading.Event()
+    stop, worker = start_queue_worker(Path.home() / 'Modulus Papers', pause_event=pause, wake_event=wake)
     try:
-        _interactive_loop(pause)
+        _interactive_loop(pause, wake)
     finally:
-        stop.set()  # Pending jobs stay on disk; never wait on a network request here.
+        stop.set()
+        wake.set()  # Pending jobs stay on disk; never wait on a network request here.
 
 
-def _interactive_loop(pause_uploads=None):
+def _interactive_loop(pause_uploads=None, wake_uploads=None):
     print('\nMODULUS — one paper workspace, shared by Claude and ChatGPT')
     print('Local Mac processing and file uploads do not use GitHub Actions minutes.')
     print('Pending uploads retry while this window is open; closing keeps the saved queue.')
     print('Your PDFs/results go ONLY to the private repository. No Netlify deployment.')
-    print('Drag a BATCH FOLDER, a question PDF OR an existing result ZIP. Type q to finish.')
+    print('Drag a BATCH FOLDER, a question PDF OR an existing result ZIP.')
+    print('Type g to connect GitHub when convenient, or q to finish. Login is not needed to process papers.')
     while True:
         if pause_uploads is not None:
             pause_uploads.clear()
+        if wake_uploads is not None:
+            wake_uploads.set()
         raw = input('\nBatch folder / question PDF / result ZIP > ').strip()
         if pause_uploads is not None:
             pause_uploads.set()
         if raw.lower() == 'q':
             return
         try:
+            if raw.lower() == 'g':
+                connect_github()
+                continue
             path = path_from_prompt(raw)
             if path is not None and path.is_dir():
                 interactive_batch(path)
@@ -1130,11 +1174,23 @@ def _interactive_loop(pause_uploads=None):
             choice = input('Standard JEE Main mock marking (+4/-1/0, 180 min)? y / Enter for unspecified > ').strip().lower()
             profile = 'jee-main-mock' if choice == 'y' else 'unspecified'
             args = argparse.Namespace(source=path, paper_id=pid, root=Path.home() / 'Modulus Papers',
-                    key=key, solutions=solutions, profile=profile, offline=False, keep_color=False)
-            if path.suffix.lower() == '.zip':
-                attach(args)
-            else:
-                process(args)
+                    key=key, solutions=solutions, profile=profile, offline=True, keep_color=False)
+            try:
+                if path.suffix.lower() == '.zip':
+                    folder = attach(args)
+                else:
+                    folder = process(args)
+            except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError):
+                held_folder = Path(args.root) / pid
+                state = held_folder / 'status.json'
+                try:
+                    if state.is_file() and json.loads(state.read_text()).get('state') == 'held':
+                        queue_sync(held_folder, 'Paper held; source report retained')
+                except (WorkspaceError, OSError, ValueError) as queue_exc:
+                    print('Source report kept locally; queue unavailable: ' + str(queue_exc))
+                raise
+            queue_sync(folder)
+            print('Local processing complete. Upload queued; you can process the next paper.')
         except (WorkspaceError, OSError, ValueError, subprocess.SubprocessError) as exc:
             print('\nSTOPPED: ' + str(exc))
             print('Nothing was published. Local originals/results are retained.')
