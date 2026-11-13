@@ -1,3 +1,15 @@
+# PDF preflight compatibility and source-title correction — 13 November 2026
+
+**247 tests passed** with `python -m unittest discover -s tests -v` on Linux (229 prior + 14 PDF compatibility + 4 additional source-title regressions). Python compilation, both shell syntax checks and `git diff --check` passed. Tested client blob: `e3886d7af147c7ac8130e6a315c6dd68c6641fb4`. Cropper SHA remains unchanged `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.
+
+Confirmed defect: valid PDF page Contents arrays can contain indirect PDFObjRef objects. Calling get_data directly on those references raised AttributeError, then a broad handler mislabeled the file unreadable/corrupt/password-protected. The correction resolves each reference and explicitly requires PDFStream before decoding; it does not coerce malformed non-stream values into empty valid content. Generic parser failures now name the actual exception class, while genuine PDFPasswordIncorrect, including the known pdfplumber wrapper, gets its own password message. Three prior corrupt-fixture tests now assert the truthful preflight-failure category instead of requiring the old misleading word. Password regression assertions use exact diagnostics and a neutral filename.
+
+The new proper-xref fixtures cover direct streams, single/multiple indirect arrays, an indirect array object, Flate compression, image-only/blank PDFs, malformed non-stream contents, true password protection versus viewable copy restriction, size/symlink safeguards, unchanged originals and companion intake. Actual Linux pdfinfo/pdftoppm parsed and rendered the valid compressed fixture successfully; pdfplumber extracted its text. A separate read-only probe also rendered these synthetic structures with the unchanged cropper renderer. No broad parser fallback or validation bypass was added.
+
+Source-title matching now treats underscores as printed label separators while retaining original evidence lines and document hashes. Synthetic Main/Advanced titles test Paper 1/2/both, unknown parts, conflicting labels/export metadata and unchanged original bytes. Filenames and numerical answers still do not determine exam family or question controls.
+
+Owner-source access, diagnostics and validation records are maintained exclusively in the private workspace handoff/context. This public report contains synthetic fixture results only. Actual Mac execution, full source cropping/OCR, answer verification, worked-solution matching, private paper transfer and exam deployment are not established by these tests. The existing launcher updates this code in place; no source renaming, conversion or reinstall is required.
+
 # Flat same-ID companions — 13 November 2026
 
 Current result: **229 tests passed** using `python -m unittest discover -s tests -v` in Linux (189prior +24 companion grouping +9 pipeline +7 unchanged-key/heading tests). Python compilation, both shell syntax checks and `git diff --check` passed. Tested client blob: `2effda9b5870f374bef3ff4dcb0352f5ec2cbc57`. Cropper SHA is unchanged: `adeb38640c19d18156456819e2d9a4e80d71b93fbcb15a89a3d73b03b0df41dc`.

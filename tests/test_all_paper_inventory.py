@@ -146,7 +146,7 @@ class AllPaperInventoryTests(unittest.TestCase):
         rows = {row['source_relative_path']: row for row in self.scan()}
         self.assertEqual(len(rows), 5)
         self.assertIsNone(rows['Valid.pdf']['reason'])
-        self.assertIn('corrupt', rows['Corrupt.pdf']['reason'])
+        self.assertIn('PDF preflight check failed', rows['Corrupt.pdf']['reason'])
         self.assertIn('24 MiB', rows['Oversized.pdf']['reason'])
         self.assertIn('Invalid export', rows['Broken export.zip']['reason'])
         self.assertIn('Word documents need a PDF copy', rows['Original Word.docx']['reason'])

@@ -931,10 +931,14 @@ SOURCE_EVIDENCE_TITLE_LINES = 12
 def _source_title_intent(text):
     """Read explicit first-page headings; filenames and answer values are irrelevant."""
     lines = [line for line in text.splitlines() if line.strip()][:SOURCE_EVIDENCE_TITLE_LINES]
+    # Some printed titles use underscores as separators. Match their labels as
+    # words, while retaining the original extracted lines as source evidence.
+    labels = [line.replace('_', ' ') for line in lines]
     label = re.compile(r'\bJ\.?\s*E\.?\s*E\.?\s*[-:]?\s*(?:\(\s*(Main|Advanced)\s*\)|(Main|Advanced)\b)', re.I)
-    evidence = [line for line in lines if label.search(line)]
-    families = {'jee-' + (match.group(1) or match.group(2)).lower() for line in evidence for match in label.finditer(line)}
-    if any(re.search(r'\bMain\b', line, re.I) and re.search(r'\bAdvanced\b', line, re.I) for line in evidence):
+    evidence = [line for line, normalized in zip(lines, labels) if label.search(normalized)]
+    matched = [line for line in labels if label.search(line)]
+    families = {'jee-' + (match.group(1) or match.group(2)).lower() for line in matched for match in label.finditer(line)}
+    if any(re.search(r'\bMain\b', line, re.I) and re.search(r'\bAdvanced\b', line, re.I) for line in matched):
         families = {'jee-main', 'jee-advanced'}
     if len(families) != 1:
         return 'unknown', None, None, evidence
@@ -944,7 +948,7 @@ def _source_title_intent(text):
     # Paper identity must be in a title/standalone label. General instructions
     # such as "Both papers are compulsory" do not turn Paper I into a pair.
     standalone = re.compile(r'^\s*(?:(?:Combined\s+)?Both\s+Papers|Papers?\s*[-:]?\s*(?:1|2|I|II)(?:\s*(?:and|&)\s*(?:Paper\s*)?(?:2|II))?)(?:\s*\([^)]*\))?\s*$', re.I)
-    heading = '\n'.join(line for line in lines if line in evidence or standalone.fullmatch(line))
+    heading = '\n'.join(line for line in labels if label.search(line) or standalone.fullmatch(line))
     one = bool(re.search(r'\bPaper\s*[-:]?\s*(?:1|I)\b', heading, re.I))
     two = bool(re.search(r'\bPaper\s*[-:]?\s*(?:2|II)\b', heading, re.I))
     both = bool(re.search(r'\bBoth\s+Papers\b|\bPapers?\s*(?:1|I)\s*(?:and|&)\s*(?:Paper\s*)?(?:2|II)\b', heading, re.I))
@@ -1385,6 +1389,7 @@ def strict_pdf(path):
     path = input_pdf(path)
     try:
         import pdfplumber
+        from pdfminer.pdftypes import PDFStream, resolve1
         with pdfplumber.open(path) as doc:
             if not doc.pages:
                 raise ValueError('no pages')
@@ -1393,12 +1398,34 @@ def strict_pdf(path):
                     raise ValueError('invalid page size')
                 # Resolve content streams too, without OCR or rendering.
                 for stream in page.page_obj.contents:
-                    stream.get_data()
+                    resolved = resolve1(stream)
+                    if not isinstance(resolved, PDFStream):
+                        raise ValueError('invalid page content stream')
+                    resolved.get_data()
                 page.objects
     except ImportError as exc:
         raise WorkspaceError('PDF validation needs pdfplumber. Run the Mac launcher to install it.') from exc
     except Exception as exc:
-        raise WorkspaceError('Unreadable/corrupt or password-protected PDF: ' + path.name) from exc
+        # A parser/programming failure is not evidence that a viewable source is
+        # corrupt or encrypted. Name the actual failure class for diagnostics.
+        from pdfminer.pdfdocument import PDFPasswordIncorrect
+        password_required = isinstance(exc, PDFPasswordIncorrect)
+        # Recent pdfplumber wraps PDFDocument failures. Inspect only its known
+        # wrapper, without treating unrelated parser failures as encryption.
+        if not password_required:
+            try:
+                from pdfplumber.utils.exceptions import PdfminerException
+            except ImportError:
+                pass  # Older pdfplumber versions raise the original exception.
+            else:
+                if isinstance(exc, PdfminerException):
+                    wrapped = (exc.__cause__, exc.__context__, *exc.args)
+                    password_required = any(isinstance(error, PDFPasswordIncorrect)
+                                            for error in wrapped)
+        if password_required:
+            raise WorkspaceError('PDF requires a password before processing: ' + path.name) from exc
+        raise WorkspaceError('PDF preflight check failed (' + type(exc).__name__ + '): ' +
+                             path.name + '. Original file kept unchanged.') from exc
     return path
 
 

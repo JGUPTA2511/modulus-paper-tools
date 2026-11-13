@@ -199,7 +199,7 @@ class BatchTests(unittest.TestCase):
         export(unsafe / 'export.zip', extra={'../escape': b'unsafe'})
         entries = w.discover_batch(self.source, self.root)
         self.assertTrue(all(e['reason'] for e in entries))
-        self.assertIn('corrupt', entries[0]['reason'])
+        self.assertIn('PDF preflight check failed', entries[0]['reason'])
         self.assertIn('24 MiB', entries[1]['reason'])
         self.assertIn('Invalid export', entries[2]['reason'])
         self.assertIn('Unsafe archive path', entries[3]['reason'])
