@@ -96,6 +96,40 @@ def clean_image(img, remove_color=False):
     return Image.fromarray(arr), changed
 
 
+def remove_repeated_margin_branding(files, band=0.09, share=0.6, min_pages=4):
+    """Whiten branding that repeats in the same place in the top/bottom page margins
+    (institute names, logos, running headers/footers, website lines). Works on scans too.
+    A pixel counts as branding only if it is dark in at least `share` of the pages, so question
+    content, which differs from page to page, is never touched. Page numbers change and are kept.
+    Returns the number of pages changed."""
+    import cv2
+    if len(files) < min_pages:
+        return 0
+    imgs = [np.array(Image.open(f).convert('RGB')) for f in files]
+    H, W = imgs[0].shape[:2]
+    if any(a.shape[:2] != (H, W) for a in imgs):
+        return 0
+    bh = max(1, int(H * band))
+    regions = (slice(0, bh), slice(H - bh, H))
+    changed = 0
+    kill = np.zeros((H, W), bool)
+    for rg in regions:
+        ink = np.stack([(a[rg].min(axis=2) < 170) for a in imgs]).astype('float32')
+        common = (ink.mean(axis=0) >= share).astype('uint8')
+        if common.sum() == 0:
+            continue
+        kill[rg] = cv2.dilate(common, np.ones((7, 7), 'uint8')).astype(bool)
+    if not kill.any():
+        return 0
+    for f, a in zip(files, imgs):
+        hit = kill & (a.min(axis=2) < 235)
+        if hit.any():
+            a[kill] = 255
+            Image.fromarray(a).save(f)
+            changed += 1
+    return changed
+
+
 # ----------------------------------------------------------------------------- anchors
 def text_layer_words(pdf, page_index, dpi):
     """Words from the PDF text layer, in rendered-pixel coordinates. [] if none."""
@@ -822,6 +856,9 @@ def main():
             im2, pct = clean_image(im, remove_color=not args.keep_color)
             im2.save(f)
             cleaned[f.name] = round(pct, 2)
+        branded = remove_repeated_margin_branding(files)
+        if branded:
+            print(f'Removed repeated header/footer branding on {branded} pages')
     pages, questions, key = detect(pdf, files, args)
     for pg in pages:
         pg['cleaned_pct'] = cleaned.get(pg['file'], 0)

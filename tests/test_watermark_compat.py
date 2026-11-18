@@ -41,3 +41,34 @@ class WatermarkCompatibilityTests(unittest.TestCase):
         self.assertEqual(retained.getpixel((220, 110)), (255, 0, 0))
         self.assertEqual(removed.getpixel((220, 110)), (255, 255, 255))
         self.assertEqual(removed.getpixel((40, 75)), (0, 0, 0))
+
+
+class RepeatedBrandingTests(unittest.TestCase):
+    def test_repeated_header_footer_branding_removed_but_page_content_kept(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            for i in range(6):
+                im = Image.new('RGB', (400, 600), 'white')
+                d = ImageDraw.Draw(im)
+                d.rectangle((120, 10, 280, 30), fill='black')          # institute name in header
+                d.rectangle((150, 575, 250, 590), fill='black')        # footer website line
+                d.rectangle((40 + i * 20, 200, 90 + i * 20, 230), fill='black')   # question content differs per page
+                d.rectangle((190 + i, 580, 196 + i, 586), fill='white')  # changing page number area
+                f = Path(tmp) / f'p{i}.png'
+                im.save(f)
+                files.append(f)
+            changed = cropper.remove_repeated_margin_branding(files)
+            self.assertEqual(changed, 6)
+            for i, f in enumerate(files):
+                a = np.array(Image.open(f))
+                self.assertTrue((a[10:30, 120:280] == 255).all())
+                self.assertTrue((a[575:590, 150:250] == 255).all())
+                self.assertTrue((a[200:230, 40 + i * 20:90 + i * 20] == 0).all())
+
+    def test_too_few_pages_untouched(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / 'a.png'
+            Image.new('RGB', (100, 100), 'black').save(f)
+            self.assertEqual(cropper.remove_repeated_margin_branding([f]), 0)
