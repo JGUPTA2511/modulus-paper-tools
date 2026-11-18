@@ -37,3 +37,25 @@ class AdvancedKeyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class KeyLayoutTests(unittest.TestCase):
+    def test_split_digits_to_ranges_and_single_rows(self):
+        def r(y, cells):
+            return [dict(text=t, x0=x, x1=x + 5 * len(t), top=y, bottom=y + 10) for x, t in cells]
+        words = []
+        words += r(100, [(40, '1'), (80, 'A'), (120, '2'), (160, 'B'), (200, '3'), (240, 'C'), (280, '4'), (320, 'D'), (360, '5'), (400, 'AB')])
+        # Q6 and Q7: number "7" printed as two touching digits is not needed here; Q8 is split "8" -> "1","8"? use 12
+        words += r(130, [(40, '6'), (80, '0.1'), (115, 'to'), (150, '7'), (190, 'ACD'), (230, '8'), (270, '5'), (310, '9'), (350, '2'), (390, '10'), (430, '7')])
+        words += r(142, [(80, '0.2')])
+        words += r(170, [(40, '11'), (80, 'B')])                 # a lone last row
+        key = qb.parse_key(words)
+        self.assertEqual(key[6], '0.1-0.2')
+        self.assertEqual(key[7], 'ACD')
+        self.assertEqual(key[11], 'B')
+        self.assertEqual(sorted(key), list(range(1, 12)))
+
+    def test_touching_digits_become_one_number(self):
+        words = [dict(text='2', x0=10, x1=15, top=0, bottom=10), dict(text='8', x0=15.5, x1=20, top=0, bottom=10)]
+        merged = qb._merge_digit_fragments(words)
+        self.assertEqual([w['text'] for w in merged], ['28'])

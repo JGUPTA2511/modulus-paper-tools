@@ -64,7 +64,32 @@ def load_images(folder, pages_dir):
 
 
 # ----------------------------------------------------------------------------- cleaning
-def clean_image(img, remove_color=False):
+def repeating_overlay_masks(files, share=0.5, tol=14, min_pages=4):
+    """A watermark, logo or border is printed in the same place on (almost) every page, while the
+    questions differ from page to page. Compare the pages with each other: a pixel that has the
+    same pale/grey value in at least `share` of the pages is the overlay, and it is whitened only
+    where THIS page still shows that same value. Diagram fills, coloured text and anything that
+    differs from the overlay are never touched. Returns one boolean mask per page, or None."""
+    import cv2
+    if len(files) < min_pages:
+        return None
+    gs = []
+    for f in files:
+        gs.append(np.array(Image.open(f).convert('RGB')).min(axis=2))
+    shape = gs[0].shape
+    if any(g.shape != shape for g in gs):
+        return None
+    stack = np.stack(gs)
+    wm = np.median(stack, axis=0)
+    agree = (np.abs(stack.astype('int16') - wm[None].astype('int16')) <= tol).mean(axis=0) >= share
+    overlay = agree & (wm < 248)
+    if overlay.mean() < 0.0005:
+        return None
+    overlay = cv2.dilate(overlay.astype('uint8'), np.ones((3, 3), 'uint8')).astype(bool)
+    return [overlay & (np.abs(g.astype('int16') - wm.astype('int16')) <= 3 * tol) for g in gs]
+
+
+def clean_image(img, remove_color=False, faint_min=150):
     """Remove watermarks and pen marks from a page image.
     * Light grey / faint-tint marks (typical watermarks, logos, stamps) are whitened, but never
       anything touching the dark text, so characters keep their shape.
@@ -76,7 +101,7 @@ def clean_image(img, remove_color=False):
     sat, val = hsv[..., 1].astype(int), hsv[..., 2].astype(int)
     dark = (val < 140).astype('uint8')
     halo = cv2.dilate(dark, np.ones((5, 5), 'uint8')).astype(bool)
-    kill = (~halo) & (val >= 150) & (sat < 120)           # light grey / faint tint
+    kill = (~halo) & (val >= faint_min) & (sat < 120)           # light grey / faint tint
     if remove_color:
         strong = (sat >= 120) & (val >= 50)
         strong = cv2.dilate(strong.astype('uint8'), np.ones((5, 5), 'uint8')).astype(bool)
@@ -254,6 +279,12 @@ def cluster_columns(cands, page_w):
         good = [max(clusters, key=lambda c: len({k['n'] for k in c}))]
     biggest = max(len(c) for c in good)
     keep = [c for c in good if len(c) >= max(2, biggest * 0.3)] or [max(good, key=len)]
+    # a lone number left of everything else is the margin number of a question whose text holds a
+    # numbered sub-list ("1) 2) 3) 4)") further right; without it that question is lost
+    left_edge = min(np.mean([k['x'] for k in c]) for c in keep)
+    for c in clusters:
+        if len(c) == 1 and c not in keep and np.mean([k['x'] for k in c]) < left_edge - page_w * 0.02:
+            keep.append(c)
     # real columns sit far apart; closer clusters are stray numbers (options, sub-points)
     keep.sort(key=lambda c: np.mean([k['x'] for k in c]))
     spaced = []
@@ -327,6 +358,48 @@ def _consecutive(ns):
     return len(ns) >= 3 and all(b == a + 1 for a, b in zip(ns, ns[1:]))
 
 
+DASHLIKE_RE = re.compile(r'^(?:[-\u2013\u2014]|to|TO|To)$')
+
+
+def _merge_digit_fragments(words):
+    """A question number such as "28" is sometimes printed as two glyph groups ("2" "8") that the
+    text layer returns as two words. Rejoin single digits that touch."""
+    out = []
+    for w in sorted(words, key=lambda w: (round(w['top'] / max(1.0, (w['bottom'] - w['top']) * 0.6)), w['x0'])):
+        p = out[-1] if out else None
+        h = max(1.0, w['bottom'] - w['top'])
+        if (p is not None and re.fullmatch(r'\d', p['text'].strip()) and re.fullmatch(r'\d', w['text'].strip())
+                and abs(p['top'] - w['top']) <= 0.3 * h and 0 <= w['x0'] - p['x1'] < 0.35 * h):
+            out[-1] = dict(p, text=p['text'].strip() + w['text'].strip(), x1=w['x1'])
+        else:
+            out.append(w)
+    return out
+
+
+def _seq_pairs(texts):
+    """Read a key row as  N answer  N+1 answer ...  A dash or "to" where the next number should
+    be belongs to the previous answer (a range whose other end is printed on the next line)."""
+    pairs, i = [], 0
+    while i < len(texts):
+        t = texts[i]
+        if not pairs:
+            if not PLAIN_NUM_RE.match(t):
+                break
+        elif t != str(pairs[-1][0] + 1):
+            if DASHLIKE_RE.match(t):
+                if not re.search(r'[-\u2013\u2014]$', pairs[-1][1]):
+                    pairs[-1][1] += '-'
+                i += 1
+                continue
+            break
+        if i + 1 >= len(texts) or not ANS_RE.match(texts[i + 1]):
+            break
+        a = texts[i + 1]
+        pairs.append([int(t), a.strip('()').upper() if re.fullmatch(r'\(?[A-Da-d1-4]\)?|[A-Da-d]{2,4}', a) else a])
+        i += 2
+    return [(q, a) for q, a in pairs]
+
+
 def _resolve_range_answers(pairs, row, rows_all, rows_index):
     """A numerical answer printed as a range ("29.6 - 30.5") is laid out as a dash in the
     answer cell with the two ends stacked above and below it. Rebuild it as "29.6-30.5".
@@ -335,7 +408,8 @@ def _resolve_range_answers(pairs, row, rows_all, rows_index):
     out = []
     for n, a in pairs:
         if re.fullmatch(r'-?\d{1,5}(?:\.\d+)?[-\u2013\u2014]', a):      # "1.29-" with the other end on the next line
-            cell = next((w for w in row if w['text'].strip() == a), None)
+            base_text = a.rstrip('-\u2013\u2014')
+            cell = next((w for w in row if w['text'].strip() in (a, base_text)), None)
             i = rows_index.get(id(row))
             if cell is not None and i is not None:
                 h = max(1.0, row[0]['bottom'] - row[0]['top'])
@@ -375,7 +449,8 @@ def parse_key(words):
        text are never mistaken for a key); the short last row of a key is accepted when it simply
        continues the numbering."""
     key, partial = {}, []
-    rows_all = _rows(words)
+    singles = []
+    rows_all = _rows(_merge_digit_fragments(words))
     rows_index = {id(r): i for i, r in enumerate(rows_all)}
     for row in rows_all:
         texts = [w['text'].strip() for w in row]
@@ -392,12 +467,25 @@ def parse_key(words):
         if len(pairs) < 2 and len(texts) >= 4 and len(texts) % 2 == 0 and \
                 all(PLAIN_NUM_RE.match(t) for t in texts[0::2]) and all(ANS_RE.match(t) for t in texts[1::2]):
             pairs = [(int(n), a.strip('()').upper()) for n, a in zip(texts[0::2], texts[1::2])]   # layout B: table cells
+        if len(pairs) < 5:
+            seq = _seq_pairs(texts)
+            if len(seq) > len(pairs):
+                pairs = seq
+        if len(texts) == 2 and PLAIN_NUM_RE.match(texts[0]) and ANS_RE.match(texts[1]):
+            singles.append((int(texts[0]), texts[1].strip('()').upper()))
         if len(pairs) >= 2 and _consecutive([p[0] for p in pairs]) if len(pairs) >= 3 else (len(pairs) == 2 and pairs[1][0] == pairs[0][0] + 1):
             pairs = _resolve_range_answers(pairs, row, rows_all, rows_index)
             (key.update(dict(pairs)) if len(pairs) >= 5 else partial.append(pairs))
     for pairs in partial:                    # short last row continuing the numbering
         if key and (pairs[0][0] - 1 in key or pairs[-1][0] + 1 in key or pairs[0][0] == max(key) + 1):
             key.update(dict(pairs))
+    changed = True
+    while changed:                           # a lone "N answer" row, next to numbers already read
+        changed = False
+        for n, a in singles:
+            if n not in key and (n - 1 in key or n + 1 in key):
+                key[n] = a
+                changed = True
     return key
 
 
@@ -744,7 +832,13 @@ def detect(pdf, page_files, args):
             mk = sorted(m['y'] for m in page_markers[pi] if cx0 - W * 0.05 <= m['x'] <= cx1)
             cut0 = [y for y in mk if top_lim <= y < starts[0]]
             end0 = int(min(cut0)) - 3 if cut0 else starts[0]
-            if end0 - top_lim > 12:
+            # a subject banner ("PHYSICS ... Max Marks: 60") at the top of the page is not the end of
+            # the previous question; without this it was stitched under that question as a blank tail
+            top_words = [w['text'] for w in page_words[pi]
+                         if top_lim <= (w['top'] + w['bottom']) / 2 < end0 and cx0 <= (w['x0'] + w['x1']) / 2 <= cx1]
+            banner = len(top_words) <= 8 and any(t.rstrip(':').upper() in
+                                                 ('PHYSICS', 'CHEMISTRY', 'MATHEMATICS', 'MATHS', 'MARKS') for t in top_words)
+            if end0 - top_lim > 12 and not banner:
                 box = trim_box(mask, cx0, top_lim, cx1, end0, args.pad)
                 if box and prev_q is not None and (box[3] - box[1]) > H * 0.01:
                     prev_q['parts'].append(dict(page=pi, box=list(map(int, box)), continuation=True))
@@ -929,10 +1023,19 @@ def main():
     if not args.no_clean:
         orig = out / 'pages_original'
         orig.mkdir(exist_ok=True)
-        for f in files:
+        overlay = repeating_overlay_masks(files)
+        if overlay is not None:
+            print('Watermark found: it repeats on every page, so only that repeated layer is removed (diagrams and colours are kept)')
+        for idx, f in enumerate(files):
             im = Image.open(f).convert('RGB')
             im.save(orig / f.name)
-            im2, pct = clean_image(im, remove_color=not args.keep_color)
+            if overlay is not None:
+                arr = np.array(im)
+                arr[overlay[idx]] = 255
+                im = Image.fromarray(arr)
+                im2, pct = clean_image(im, remove_color=False, faint_min=232)
+            else:
+                im2, pct = clean_image(im, remove_color=not args.keep_color)
             im2.save(f)
             cleaned[f.name] = round(pct, 2)
         branded = remove_repeated_margin_branding(files)
