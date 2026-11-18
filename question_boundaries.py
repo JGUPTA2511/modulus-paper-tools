@@ -304,7 +304,9 @@ def detect_bands(masks):
 
 
 NUMP_RE = re.compile(r'^(\d{1,3})[).]$')
-ANS_RE = re.compile(r'^\(?[A-Da-d1-4]\)?$|^-?\d{1,5}(?:\.\d+)?$')
+ANS_RE = re.compile(r'^\(?[A-Da-d1-4]\)?$|^-?\d{1,5}(?:\.\d+)?$|^[A-Da-d]{2,4}$|^[-\u2013\u2014]$|^-?\d{1,5}(?:\.\d+)?[-\u2013\u2014]$')
+DASH_RE = re.compile(r'^[-\u2013\u2014]$')
+LONE_NUM_RE = re.compile(r'^-?\d{1,5}(?:\.\d+)?$')
 PLAIN_NUM_RE = re.compile(r'^\d{1,3}$')
 
 
@@ -325,6 +327,47 @@ def _consecutive(ns):
     return len(ns) >= 3 and all(b == a + 1 for a, b in zip(ns, ns[1:]))
 
 
+def _resolve_range_answers(pairs, row, rows_all, rows_index):
+    """A numerical answer printed as a range ("29.6 - 30.5") is laid out as a dash in the
+    answer cell with the two ends stacked above and below it. Rebuild it as "29.6-30.5".
+    A dash whose ends cannot be found stays "-" (the question is then held, never guessed)."""
+    texts = [w['text'].strip() for w in row]
+    out = []
+    for n, a in pairs:
+        if re.fullmatch(r'-?\d{1,5}(?:\.\d+)?[-\u2013\u2014]', a):      # "1.29-" with the other end on the next line
+            cell = next((w for w in row if w['text'].strip() == a), None)
+            i = rows_index.get(id(row))
+            if cell is not None and i is not None:
+                h = max(1.0, row[0]['bottom'] - row[0]['top'])
+                for j in (i + 1, i - 1):
+                    for w in (rows_all[j] if 0 <= j < len(rows_all) else []):
+                        if (LONE_NUM_RE.match(w['text'].strip()) and abs(w['x0'] - cell['x0']) <= 3 * h
+                                and abs(w['top'] - cell['top']) <= 3 * h):
+                            a = a.rstrip('-\u2013\u2014') + '-' + w['text'].strip()
+                            break
+                    if not a.endswith(('-', '\u2013', '\u2014')):
+                        break
+        elif DASH_RE.match(a):
+            cell = next((w for w in row if DASH_RE.match(w['text'].strip())
+                         and any(t == n and True for t in [n])), None)
+            dash = [w for w in row if DASH_RE.match(w['text'].strip())]
+            ends = []
+            i = rows_index.get(id(row))
+            if dash and i is not None:
+                x = (dash[0]['x0'] + dash[0]['x1']) / 2
+                h = max(1.0, row[0]['bottom'] - row[0]['top'])
+                for j in (i - 1, i + 1):
+                    if 0 <= j < len(rows_all):
+                        for w in rows_all[j]:
+                            if (LONE_NUM_RE.match(w['text'].strip()) and abs((w['x0'] + w['x1']) / 2 - x) <= 3 * h
+                                    and abs(w['top'] - row[0]['top']) <= 3 * h):
+                                ends.append((w['top'], w['text'].strip()))
+            ends.sort()
+            a = f'{ends[0][1]}-{ends[-1][1]}' if len(ends) >= 2 else a
+        out.append((n, a))
+    return out
+
+
 def parse_key(words):
     """Answer-key entries from a page -> {12: '3'}. Understands two layouts, read row by row:
        "1) 2   2) 3   3) 1 ..."  (numbers with a bracket)   and   a table  | 1 | 2 | 2 | 3 | ...
@@ -332,7 +375,9 @@ def parse_key(words):
        text are never mistaken for a key); the short last row of a key is accepted when it simply
        continues the numbering."""
     key, partial = {}, []
-    for row in _rows(words):
+    rows_all = _rows(words)
+    rows_index = {id(r): i for i, r in enumerate(rows_all)}
+    for row in rows_all:
         texts = [w['text'].strip() for w in row]
         pairs, i = [], 0
         while i < len(texts) - 1:           # layout A: "N)" then answer
@@ -348,9 +393,10 @@ def parse_key(words):
                 all(PLAIN_NUM_RE.match(t) for t in texts[0::2]) and all(ANS_RE.match(t) for t in texts[1::2]):
             pairs = [(int(n), a.strip('()').upper()) for n, a in zip(texts[0::2], texts[1::2])]   # layout B: table cells
         if len(pairs) >= 2 and _consecutive([p[0] for p in pairs]) if len(pairs) >= 3 else (len(pairs) == 2 and pairs[1][0] == pairs[0][0] + 1):
+            pairs = _resolve_range_answers(pairs, row, rows_all, rows_index)
             (key.update(dict(pairs)) if len(pairs) >= 5 else partial.append(pairs))
     for pairs in partial:                    # short last row continuing the numbering
-        if key and pairs[0][0] == max(key) + 1:
+        if key and (pairs[0][0] - 1 in key or pairs[-1][0] + 1 in key or pairs[0][0] == max(key) + 1):
             key.update(dict(pairs))
     return key
 
@@ -383,7 +429,24 @@ def key_from_file(path, dpi):
     return key
 
 
-def gate(pages, questions, key):
+ADV_MARKERS = (r'NON[- ]?NEGATIVE\s+INTEGER', r'NUMERICAL\s+VALUE', r'MULTIPLE\s+CORRECT', r'JEE[- ]?ADV', r'PARAGRAPH')
+
+
+def detect_paper_kind(pdf, max_pages=4):
+    """'advanced' when the paper's own instruction pages describe JEE-Advanced style sections
+    (multiple-correct, integer, numerical or paragraph questions, where many questions have no
+    (A)-(D) options); otherwise 'main'. The paper decides, so one tool handles both kinds."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf)) as doc:
+            text = ' '.join((pg.extract_text() or '') for pg in doc.pages[:max_pages]).upper()
+    except Exception:
+        return 'main'
+    hits = sum(1 for m in ADV_MARKERS if re.search(m, text))
+    return 'advanced' if hits >= 2 else 'main'
+
+
+def gate(pages, questions, key, kind='main'):
     """Return the reasons this upload is NOT accepted (empty list = accepted)."""
     why = []
     nums = [q['number'] for q in questions]
@@ -391,7 +454,9 @@ def gate(pages, questions, key):
     if missing:
         why.append(f'question numbers missing: {missing[:15]}')
     with_opts = sum(1 for q in questions if q.get('options_found', 0) >= 3)
-    if with_opts < 0.65 * len(questions):
+    # JEE Advanced papers mix choice questions with integer/numerical ones that carry no options
+    need = 0.25 if kind == 'advanced' else 0.65
+    if with_opts < need * len(questions):
         why.append(f'only {with_opts} of {len(questions)} items have answer options (1)-(4)/(A)-(D); '
                    'this looks like a solutions/hints file, not a question paper')
     if not key:
@@ -624,6 +689,20 @@ def detect(pdf, page_files, args):
     by_page_col = {}
     for a in chosen:
         by_page_col.setdefault((a['page'], a['col']), []).append(a)
+    # A "column" none of whose numbers belong to the chosen 1,2,3... sequence is not a column of
+    # questions (typically a numbered sub-list such as "1) Br2 + PCl3  2) H2O" inside a question).
+    # Left in, it narrows the real column's boxes and cuts questions off on the right.
+    for pi in range(len(page_files)):
+        cols_pi = pages[pi]['_cols']
+        used = sorted({ci for (qpi, ci) in by_page_col if qpi == pi})
+        if used and len(used) < len(cols_pi):
+            remap = {old: new for new, old in enumerate(used)}
+            pages[pi]['_cols'] = [cols_pi[i] for i in used]
+            for old in used:
+                by_page_col[(pi, remap[old])] = by_page_col.pop((pi, old)) if remap[old] != old else by_page_col[(pi, old)]
+            for ci in range(len(used), len(cols_pi)):
+                by_page_col.pop((pi, ci), None)
+            pages[pi]['ncols'] = len(used)
     prev_q = None
     for pi, pf in enumerate(page_files):
         mask = masks[pi]
@@ -884,7 +963,9 @@ def main():
         (out / 'source_key.json').write_text(json.dumps(source_key, indent=1))
     elif args.key:
         key = key_from_file(args.key, args.dpi)
-    why = gate(pages, questions, key)
+    paper_kind = detect_paper_kind(pdf)
+    print(f'Paper type detected: JEE {paper_kind.title()}')
+    why = gate(pages, questions, key, paper_kind)
     layout = getattr(args, '_source_layout', None)
     images_ready, grading_issues = False, []
     if layout:
