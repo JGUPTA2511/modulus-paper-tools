@@ -14,7 +14,7 @@ Development staging is not live publication. The existing Netlify build includes
 
 Claude maintains `question_boundaries.py` (the existing Mac cropper). ChatGPT maintains the original `workspace_client.py` private handoff; Codex added batch orchestration and retry protections around it. The existing `Run_Question_Boundaries.command` launcher is retained. Cropping and watermark reduction are unchanged and run locally, with no paid service or AI API.
 
-Private workspace: `JGUPTA2511/modulus-practice-corner`, branch `paper-workspace`, folder `paper_jobs/<PAPER-ID>/`. Uploading here is **not** deploying an examination. App integration stays on `development`; live `main` is untouched.
+Private workspace: `Modulus-tutorials/modulus-practice-corner`, branch `paper-workspace`, folder `paper_jobs/<PAPER-ID>/`. Uploading here is **not** deploying an examination. App integration stays on `development`; live `main` is untouched.
 
 ## Batch routine on your Mac
 

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import zipfile
 
-REPO = 'JGUPTA2511/modulus-practice-corner'
+REPO = 'Modulus-tutorials/modulus-practice-corner'
 BRANCH = 'development'
 SCHEMA = 'modulus_paper_integration_v1'
 MAX_FILE = 24 * 1024 * 1024

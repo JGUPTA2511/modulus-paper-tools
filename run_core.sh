@@ -36,7 +36,7 @@ if ! "$MODULUS_PYTHON" -c 'import PIL,numpy,cv2,pytesseract,pdfplumber' 2>/dev/n
   echo 'Installing missing local Python packages (first setup only)...'
   "$MODULUS_PYTHON" -m pip install --quiet --disable-pip-version-check pillow numpy opencv-python-headless pytesseract pdfplumber
 fi
-BASE='https://raw.githubusercontent.com/JGUPTA2511/modulus-paper-tools/main'
+BASE='https://raw.githubusercontent.com/Modulus-tutorials/modulus-paper-tools/main'
 MODULUS_UPDATE_DIR="$(mktemp -d)"
 trap 'rm -rf "$MODULUS_UPDATE_DIR"' EXIT
 # Stage the client, cropper and its small readers together. A partial download

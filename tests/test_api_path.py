@@ -17,8 +17,8 @@ class APIPathTests(unittest.TestCase):
         result = argparse.Namespace(returncode=0, stdout='{}', stderr='')
         with patch.object(w.subprocess, 'run', return_value=result) as call:
             api.call('')
-        self.assertIn('repos/JGUPTA2511/modulus-practice-corner', call.call_args.args[0])
-        self.assertNotIn('repos/JGUPTA2511/modulus-practice-corner/', call.call_args.args[0])
+        self.assertIn('repos/Modulus-tutorials/modulus-practice-corner', call.call_args.args[0])
+        self.assertNotIn('repos/Modulus-tutorials/modulus-practice-corner/', call.call_args.args[0])
 
 if __name__ == '__main__':
     unittest.main()

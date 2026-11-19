@@ -31,7 +31,7 @@ import tempfile
 import uuid
 import zipfile
 
-REPO = 'JGUPTA2511/modulus-practice-corner'
+REPO = 'Modulus-tutorials/modulus-practice-corner'
 BRANCH = 'paper-workspace'
 MAX_FILE = 24 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
